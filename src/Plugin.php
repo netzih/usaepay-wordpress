@@ -28,6 +28,7 @@ final class Plugin {
       return;
     }
     self::$instance = new self($file);
+    self::$instance->hooks();
   }
 
   public static function instance(): Plugin {
@@ -42,6 +43,9 @@ final class Plugin {
     $this->settings = new Settings();
     $this->gateway = new Gateway($this->settings);
 
+  }
+
+  private function hooks(): void {
     DonorMessage::setTranslator(static fn(string $text): string => __($text, 'usaepay-payments'));
 
     add_action('init', [$this, 'loadTextdomain']);
