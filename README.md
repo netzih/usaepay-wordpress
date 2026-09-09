@@ -5,7 +5,7 @@ One plugin, one USAePay account, three integrations: **Gravity Forms**,
 Pay.js fields; this site only ever handles single-use payment keys and
 saved-card references.
 
-Built on [`chabadrichmond/usaepay-php`](../usaepay-php), the framework-free
+Built on [`chabadrichmond/usaepay-php`](lib/usaepay-php), the framework-free
 client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 (void unsettled / refund settled, no top-level `email`, reconciliation by
 `orderid`) is shared and unit tested once.

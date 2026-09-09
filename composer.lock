@@ -4,15 +4,15 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "c587a8d977f55edab86358d33da927b8",
+    "content-hash": "550b099592b0bac0d1c5658a17d62877",
     "packages": [
         {
             "name": "chabadrichmond/usaepay-php",
             "version": "dev-main",
             "dist": {
                 "type": "path",
-                "url": "../usaepay-php",
-                "reference": "0f63728145422c02355b40621a6cb6f0e151b74f"
+                "url": "lib/usaepay-php",
+                "reference": "eb95fcd99fd4847436689333ad5fdbe4d22e24b6"
             },
             "require": {
                 "ext-curl": "*",

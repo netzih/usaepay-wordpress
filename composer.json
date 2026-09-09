@@ -11,7 +11,7 @@
     "phpunit/phpunit": "^10.5"
   },
   "repositories": [
-    { "type": "path", "url": "../usaepay-php", "options": { "symlink": true } }
+    { "type": "path", "url": "lib/usaepay-php", "options": { "symlink": true } }
   ],
   "autoload": {
     "psr-4": { "Usaepay\\WordPress\\": "src/" }
