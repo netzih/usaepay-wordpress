@@ -151,7 +151,10 @@
       }
       return key;
     }, function (error) {
-      throw new Error(payerWording(errorText(error)));
+      var raw = errorText(error);
+      var wrapped = new Error(payerWording(raw));
+      wrapped.raw = raw;
+      throw wrapped;
     });
   }
 

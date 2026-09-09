@@ -66,9 +66,10 @@ final class Plugin {
       return;
     }
     \GFForms::include_payment_addon_framework();
-    if (class_exists(Modules\GravityForms\AddOn::class)) {
-      \GFAddOn::register(Modules\GravityForms\AddOn::class);
+    if (!\GF_Fields::exists(Modules\GravityForms\CardField::TYPE)) {
+      \GF_Fields::register(new Modules\GravityForms\CardField());
     }
+    \GFAddOn::register(Modules\GravityForms\AddOn::class);
   }
 
   public function settings(): Settings {

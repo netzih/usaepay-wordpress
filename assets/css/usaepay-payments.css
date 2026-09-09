@@ -32,3 +32,8 @@
 .usaepay-apple-pay-divider { display: flex; align-items: center; margin: 12px 0 0; color: #646970; font-size: 0.9em; }
 .usaepay-apple-pay-divider::before, .usaepay-apple-pay-divider::after { content: ""; flex: 1; border-top: 1px solid #c3c4c7; }
 .usaepay-apple-pay-divider span { padding: 0 10px; }
+
+/* Form editor preview of the hosted fields */
+.usaepay-card-element--preview { display: flex; gap: 16px; align-items: center; color: #757575; font-size: 15px; }
+.usaepay-card-element--preview span:first-child { flex: 1; }
+.gform_wrapper .ginput_container_usaepay_card .usaepay-card-element { height: 44px; }

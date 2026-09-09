@@ -1,0 +1,685 @@
+<?php
+
+namespace Usaepay\WordPress\Modules\GravityForms;
+
+use Usaepay\AmbiguousGatewayException;
+use Usaepay\GatewayException;
+use Usaepay\WordPress\Gateway;
+use Usaepay\WordPress\Log;
+use Usaepay\WordPress\Plugin;
+
+/**
+ * Gravity Forms payment add-on. One-time feeds charge the Pay.js key in
+ * authorize(); subscription feeds charge the first installment with
+ * save_card and the renewal worker (check_status, hourly) charges the saved
+ * card reference on schedule. Nothing is scheduled at USAePay.
+ */
+final class AddOn extends \GFPaymentAddOn {
+
+  public const INTEGRATION = 'Gravity Forms';
+
+  protected $_version = Plugin::VERSION;
+
+  protected $_min_gravityforms_version = '2.9';
+
+  protected $_slug = 'gravityformsusaepay';
+
+  protected $_path = 'usaepay-payments/usaepay-payments.php';
+
+  protected $_full_path = __FILE__;
+
+  protected $_url = 'https://lab.civicrm.org/Chabadrichmond';
+
+  protected $_title = 'USAePay Payments for Gravity Forms';
+
+  protected $_short_title = 'USAePay';
+
+  protected $_requires_credit_card = FALSE;
+
+  protected $_supports_callbacks = FALSE;
+
+  protected $_capabilities = ['gravityforms_usaepay', 'gravityforms_usaepay_uninstall'];
+
+  protected $_capabilities_settings_page = 'gravityforms_usaepay';
+
+  protected $_capabilities_form_settings = 'gravityforms_usaepay';
+
+  protected $_capabilities_uninstall = 'gravityforms_usaepay_uninstall';
+
+  private static ?AddOn $_instance = NULL;
+
+  /**
+   * "Visa ending in 2224" for the card field to store once the charge went through.
+   */
+  private string $cardSummary = '';
+
+  /**
+   * Entry meta to write once the entry exists (entry_post_save).
+   */
+  private array $pendingMeta = [];
+
+  private array $pendingNotes = [];
+
+  public static function get_instance(): AddOn {
+    if (self::$_instance === NULL) {
+      self::$_instance = new self();
+    }
+    return self::$_instance;
+  }
+
+  public function __construct() {
+    $this->_full_path = Plugin::instance()->file();
+    $this->_path = plugin_basename($this->_full_path);
+    parent::__construct();
+  }
+
+  public function init() {
+    parent::init();
+    add_filter('gform_payment_statuses', [$this, 'paymentStatuses']);
+    add_action('wp_ajax_usaepay_gf_refund', [$this, 'ajaxRefund']);
+  }
+
+  public function paymentStatuses(array $statuses): array {
+    $statuses['Expired'] = __('Expired', 'usaepay-payments');
+    return $statuses;
+  }
+
+  private function gateway(): Gateway {
+    return Plugin::instance()->gateway();
+  }
+
+  public function cardSummaryForEntry(): string {
+    return $this->cardSummary;
+  }
+
+  // ---------------------------------------------------------------------
+  // Field wiring
+  // ---------------------------------------------------------------------
+
+  public function get_credit_card_field($form) {
+    $fields = \GFAPI::get_fields_by_type($form, [CardField::TYPE]);
+    return empty($fields) ? FALSE : $fields[0];
+  }
+
+  public function get_validation_result($validation_result, $authorization_result) {
+    $credit_card_page = 0;
+    foreach ($validation_result['form']['fields'] as &$field) {
+      if ($field->type === CardField::TYPE) {
+        $field->failed_validation = TRUE;
+        $field->validation_message = $authorization_result['error_message'];
+        $credit_card_page = $field->pageNumber;
+        break;
+      }
+    }
+    $validation_result['credit_card_page'] = $credit_card_page;
+    $validation_result['is_valid'] = FALSE;
+    return $validation_result;
+  }
+
+  public function can_create_feed() {
+    return $this->has_credit_card_field($this->get_current_form());
+  }
+
+  public function feed_list_title() {
+    if (!$this->has_credit_card_field($this->get_current_form())) {
+      return $this->form_settings_title();
+    }
+    return parent::feed_list_title();
+  }
+
+  public function feed_list_message() {
+    if (!$this->has_credit_card_field($this->get_current_form())) {
+      return $this->requires_credit_card_message();
+    }
+    return parent::feed_list_message();
+  }
+
+  public function requires_credit_card_message() {
+    $url = add_query_arg(['view' => NULL, 'subview' => NULL]);
+    return sprintf(
+      esc_html__('Add a USAePay Card field (Pricing Fields) to this form before creating a feed. %1$sOpen the form editor%2$s.', 'usaepay-payments'),
+      "<a href='" . esc_url($url) . "'>",
+      '</a>'
+    );
+  }
+
+  public function before_delete_field($form_id, $field_id) {
+    $field = \GFAPI::get_field($form_id, $field_id);
+    if ($field && $field->type === CardField::TYPE) {
+      foreach ($this->get_feeds($form_id) as $feed) {
+        $this->update_feed_active($feed['id'], 0);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Feed settings
+  // ---------------------------------------------------------------------
+
+  public function feed_settings_fields() {
+    $fields = parent::feed_settings_fields();
+    $fields = $this->add_field_after('feedName', [
+      [
+        'name' => 'usaepayNotice',
+        'type' => 'html',
+        'html' => '<p class="description">' . esc_html__('Charges use the USAePay account under Settings > USAePay. Subscriptions are scheduled by this site and charged hourly by WordPress cron; nothing is created in the USAePay console.', 'usaepay-payments') . '</p>',
+      ],
+    ], $fields);
+    return $fields;
+  }
+
+  public function option_choices() {
+    return [];
+  }
+
+  public function billing_info_fields() {
+    return [
+      ['name' => 'first_name', 'label' => __('First Name', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'last_name', 'label' => __('Last Name', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'email', 'label' => __('Email', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'address', 'label' => __('Address', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'address2', 'label' => __('Address 2', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'city', 'label' => __('City', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'state', 'label' => __('State', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'zip', 'label' => __('Zip', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'country', 'label' => __('Country', 'usaepay-payments'), 'required' => FALSE],
+      ['name' => 'phone', 'label' => __('Phone', 'usaepay-payments'), 'required' => FALSE],
+    ];
+  }
+
+  public function supported_notification_events($form) {
+    if (!$this->has_feed($form['id'])) {
+      return FALSE;
+    }
+    return [
+      'complete_payment' => __('Payment Completed', 'usaepay-payments'),
+      'fail_payment' => __('Payment Failed', 'usaepay-payments'),
+      'refund_payment' => __('Payment Refunded', 'usaepay-payments'),
+      'create_subscription' => __('Subscription Created', 'usaepay-payments'),
+      'add_subscription_payment' => __('Subscription Payment Added', 'usaepay-payments'),
+      'fail_subscription_payment' => __('Subscription Payment Failed', 'usaepay-payments'),
+      'cancel_subscription' => __('Subscription Cancelled', 'usaepay-payments'),
+      'expire_subscription' => __('Subscription Expired', 'usaepay-payments'),
+    ];
+  }
+
+  // ---------------------------------------------------------------------
+  // Charging
+  // ---------------------------------------------------------------------
+
+  /**
+   * One-time payment: charge the payment key immediately and hand GF the
+   * captured payment, so capture() is never needed.
+   */
+  public function authorize($feed, $submission_data, $form, $entry) {
+    $key = $this->postedPaymentKey($form);
+    if ($key === '') {
+      return $this->authorization_error(__('Please enter your card details.', 'usaepay-payments'));
+    }
+    $amount = (float) rgar($submission_data, 'payment_amount');
+    if ($amount <= 0) {
+      return $this->authorization_error(__('The payment amount could not be processed. Please contact us.', 'usaepay-payments'));
+    }
+
+    $uniqueId = $this->submissionId($form);
+    $orderId = 'gf-' . (int) $form['id'] . '-' . $uniqueId;
+    $payer = $this->payer($submission_data);
+    $metadata = $this->gateway()->metadata(
+      'GF' . (int) $form['id'] . '-' . substr($uniqueId, 0, 12),
+      $this->description($form, $feed),
+      $payer,
+      ['currency' => \GFCommon::get_currency(), 'orderid' => $orderId]
+    );
+
+    $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($amount), $metadata), $orderId);
+    if (!empty($outcome['error'])) {
+      return $this->authorization_error($outcome['error']);
+    }
+    $response = $outcome['response'];
+    $reference = Gateway::transactionReference($response);
+    $card = Gateway::card($response);
+    $this->cardSummary = self::summary($card);
+    $this->pendingMeta = [
+      'usaepay_mode' => Plugin::instance()->settings()->mode(),
+      'usaepay_order_id' => $orderId,
+      'usaepay_transaction_key' => $reference,
+      'usaepay_refnum' => (string) rgar($response, 'refnum'),
+      'usaepay_card_brand' => (string) $card['brand'],
+      'usaepay_card_last4' => (string) $card['last4'],
+      'usaepay_payer' => $payer,
+    ];
+    $this->pendingNotes[] = $this->gatewayNote($response);
+
+    return [
+      'is_authorized' => TRUE,
+      'transaction_id' => $reference,
+      'amount' => $amount,
+      'captured_payment' => [
+        'is_success' => TRUE,
+        'transaction_id' => $reference,
+        'amount' => $amount,
+        'payment_method' => $card['brand'] ?: 'Card',
+      ],
+    ];
+  }
+
+  /**
+   * Subscription: charge the first installment (or verify the card for a
+   * free trial) with save_card, then schedule the rest locally.
+   */
+  public function subscribe($feed, $submission_data, $form, $entry) {
+    $key = $this->postedPaymentKey($form);
+    if ($key === '') {
+      return $this->authorization_error(__('Please enter your card details.', 'usaepay-payments'));
+    }
+    $recurring = (float) rgar($submission_data, 'payment_amount');
+    if ($recurring <= 0) {
+      return $this->authorization_error(__('The payment amount could not be processed. Please contact us.', 'usaepay-payments'));
+    }
+    $setupFee = (float) rgar($submission_data, 'setup_fee');
+    $trialEnabled = !empty($feed['meta']['trial_enabled']);
+    $trialAmount = (float) rgar($submission_data, 'trial');
+    $length = max(1, (int) rgars($feed, 'meta/billingCycle_length'));
+    $unit = (string) rgars($feed, 'meta/billingCycle_unit', 'month');
+    $times = max(0, (int) rgars($feed, 'meta/recurringTimes'));
+
+    $firstAmount = $trialEnabled ? $trialAmount : $recurring + $setupFee;
+    $uniqueId = $this->submissionId($form);
+    $subscriptionId = 'gf-sub-' . substr($uniqueId, 0, 16);
+    $orderId = 'gf-' . (int) $form['id'] . '-' . $uniqueId;
+    $payer = $this->payer($submission_data);
+    $metadata = $this->gateway()->metadata(
+      'GF' . (int) $form['id'] . '-' . substr($uniqueId, 0, 12),
+      $this->description($form, $feed),
+      $payer,
+      ['currency' => \GFCommon::get_currency(), 'orderid' => $orderId]
+    );
+
+    if ($firstAmount > 0) {
+      $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($firstAmount), $metadata, TRUE), $orderId);
+    }
+    else {
+      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($key, $metadata), NULL);
+    }
+    if (!empty($outcome['error'])) {
+      return $this->authorization_error($outcome['error']);
+    }
+    $response = $outcome['response'];
+    $cardReference = trim((string) rgars($response, 'savedcard/key'));
+    if ($cardReference === '') {
+      // Charged (or verified) but nothing to charge later: undo and refuse.
+      $this->log_error(__METHOD__ . '(): approved without a saved card reference; voiding.');
+      if ($firstAmount > 0) {
+        try {
+          $this->gateway()->client(self::INTEGRATION)->void(Gateway::transactionReference($response));
+        }
+        catch (\Throwable $e) {
+          $this->log_error(__METHOD__ . '(): void failed: ' . $e->getMessage());
+        }
+      }
+      return $this->authorization_error(__('The card could not be saved for future payments. Please try a different card or contact us.', 'usaepay-payments'));
+    }
+
+    $card = Gateway::card($response);
+    $this->cardSummary = self::summary($card);
+    $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+    $nextDate = Schedule::installmentDate($now, $length, $unit, 1);
+    $this->pendingMeta = [
+      'usaepay_mode' => Plugin::instance()->settings()->mode(),
+      'usaepay_order_id' => $orderId,
+      'usaepay_card_reference' => $cardReference,
+      'usaepay_card_brand' => (string) $card['brand'],
+      'usaepay_card_last4' => (string) $card['last4'],
+      'usaepay_payer' => $payer,
+      'usaepay_interval_length' => $length,
+      'usaepay_interval_unit' => $unit,
+      'usaepay_recurring_times' => $times,
+      'usaepay_payments_made' => $trialEnabled ? 0 : 1,
+      'usaepay_failed_attempts' => 0,
+      'usaepay_schedule_start' => $now->format('Y-m-d H:i:s'),
+      'usaepay_installment_index' => 1,
+      'usaepay_scheduled_date' => $nextDate->format('Y-m-d H:i:s'),
+      'usaepay_next_charge' => $nextDate->format('Y-m-d H:i:s'),
+      'usaepay_form_title' => (string) rgar($form, 'title'),
+    ];
+    $this->pendingNotes[] = $this->gatewayNote($response);
+    $this->pendingNotes[] = sprintf(
+      __('Subscription schedule: %1$s %2$s, next charge %3$s (UTC)%4$s. Charged by this site through USAePay; nothing is scheduled in the USAePay console.', 'usaepay-payments'),
+      \GFCommon::to_money($recurring, \GFCommon::get_currency()),
+      Schedule::describeInterval($length, $unit),
+      $nextDate->format('Y-m-d'),
+      $times > 0 ? sprintf(__(', %d payments in total', 'usaepay-payments'), $times) : ''
+    );
+
+    $result = [
+      'is_success' => TRUE,
+      'subscription_id' => $subscriptionId,
+      'amount' => $recurring,
+    ];
+    if ($firstAmount > 0) {
+      $result['captured_payment'] = [
+        'name' => $trialEnabled ? __('Trial payment', 'usaepay-payments') : ($setupFee > 0 ? __('First payment including setup fee', 'usaepay-payments') : __('First payment', 'usaepay-payments')),
+        'is_success' => TRUE,
+        'transaction_id' => Gateway::transactionReference($response),
+        'amount' => $firstAmount,
+        'payment_method' => $card['brand'] ?: 'Card',
+      ];
+    }
+    return $result;
+  }
+
+  /**
+   * Site-managed: nothing to cancel at the gateway. GF marks the entry
+   * Cancelled and the renewal worker skips it from then on.
+   */
+  public function cancel($entry, $feed) {
+    $this->add_note($entry['id'], __('No further charges will be made. The saved card reference stays on the entry for reference.', 'usaepay-payments'));
+    return TRUE;
+  }
+
+  /**
+   * Hourly (GF schedules {slug}_cron because this method is overridden).
+   */
+  public function check_status() {
+    $summary = (new Renewals($this, $this->gateway(), Plugin::instance()->settings()))->run();
+    $this->log_debug(__METHOD__ . '(): ' . wp_json_encode($summary));
+  }
+
+  public function entry_post_save($entry, $form) {
+    $entry = parent::entry_post_save($entry, $form);
+    if ($this->is_payment_gateway && !empty($entry['id'])) {
+      foreach ($this->pendingMeta as $key => $value) {
+        gform_update_meta($entry['id'], $key, $value, $form['id']);
+      }
+      foreach ($this->pendingNotes as $note) {
+        $this->add_note($entry['id'], $note);
+      }
+    }
+    $this->pendingMeta = [];
+    $this->pendingNotes = [];
+    return $entry;
+  }
+
+  // ---------------------------------------------------------------------
+  // Refunds (entry detail)
+  // ---------------------------------------------------------------------
+
+  public function entry_info($form_id, $entry) {
+    parent::entry_info($form_id, $entry);
+    if (!$this->is_payment_gateway($entry['id']) || !\GFCommon::current_user_can_any($this->_capabilities_settings_page)) {
+      return;
+    }
+    $refundable = (string) rgar($entry, 'transaction_type') === '1' && rgar($entry, 'payment_status') === 'Paid';
+    if (!$refundable) {
+      return;
+    }
+    ?>
+    <div class="usaepay-refund" style="margin-top:10px">
+      <label for="usaepay-refund-amount"><?php esc_html_e('Refund amount', 'usaepay-payments'); ?></label>
+      <input type="number" step="0.01" min="0.01" max="<?php echo esc_attr((string) rgar($entry, 'payment_amount')); ?>" id="usaepay-refund-amount" value="<?php echo esc_attr((string) rgar($entry, 'payment_amount')); ?>" style="width:7em">
+      <button type="button" class="button" id="usaepay-refund-button" data-entry-id="<?php echo (int) $entry['id']; ?>" data-nonce="<?php echo esc_attr(wp_create_nonce('usaepay_gf_refund')); ?>"><?php esc_html_e('Refund via USAePay', 'usaepay-payments'); ?></button>
+      <p class="description"><?php esc_html_e('Unsettled (same-day) sales can only be voided in full; settled sales can be refunded in full or in part.', 'usaepay-payments'); ?></p>
+      <div id="usaepay-refund-result"></div>
+    </div>
+    <?php
+  }
+
+  public function ajaxRefund(): void {
+    check_ajax_referer('usaepay_gf_refund', 'nonce');
+    if (!\GFCommon::current_user_can_any($this->_capabilities_settings_page)) {
+      wp_send_json_error(['message' => __('Access denied.', 'usaepay-payments')]);
+    }
+    $entry_id = (int) rgpost('entry_id');
+    $entry = \GFAPI::get_entry($entry_id);
+    if (is_wp_error($entry) || !$this->is_payment_gateway($entry_id)) {
+      wp_send_json_error(['message' => __('This entry was not paid through USAePay.', 'usaepay-payments')]);
+    }
+    if (rgar($entry, 'payment_status') !== 'Paid') {
+      wp_send_json_error(['message' => __('Only paid entries can be refunded.', 'usaepay-payments')]);
+    }
+    $amount = (float) rgpost('amount');
+    $paid = (float) rgar($entry, 'payment_amount');
+    if ($amount <= 0 || $amount > $paid + 0.00001) {
+      wp_send_json_error(['message' => __('Enter an amount between 0.01 and the amount paid.', 'usaepay-payments')]);
+    }
+    $mode = (string) gform_get_meta($entry_id, 'usaepay_mode');
+    if ($mode !== '' && $mode !== Plugin::instance()->settings()->mode()) {
+      wp_send_json_error(['message' => sprintf(__('This payment was made in %s mode; switch USAePay to that mode to refund it.', 'usaepay-payments'), $mode)]);
+    }
+    $reference = (string) (gform_get_meta($entry_id, 'usaepay_transaction_key') ?: rgar($entry, 'transaction_id'));
+
+    try {
+      $client = $this->gateway()->client(self::INTEGRATION);
+      $transaction = $client->getTransaction($reference);
+      $status = (string) rgar($transaction, 'status_code');
+      $full = abs($amount - $paid) < 0.005;
+      if ($status === 'P' || $status === 'A') {
+        if (!$full) {
+          wp_send_json_error(['message' => __('This sale has not settled yet, so it can only be voided in full. Try a partial refund tomorrow.', 'usaepay-payments')]);
+        }
+        $response = $client->void($reference);
+        $action = 'void';
+      }
+      else {
+        $response = $client->refund($reference, self::money($amount));
+        $action = 'refund';
+      }
+    }
+    catch (GatewayException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      wp_send_json_error(['message' => $e->getMessage()]);
+    }
+    if (!Gateway::approved($response)) {
+      $failure = Gateway::failure($response);
+      $this->log_error(__METHOD__ . '(): ' . $failure['gateway']);
+      wp_send_json_error(['message' => $failure['gateway']]);
+    }
+
+    $refundReference = Gateway::transactionReference($response) ?: $reference;
+    $this->refund_payment($entry, [
+      'transaction_id' => $refundReference,
+      'amount' => $amount,
+      'note' => $action === 'void'
+        ? sprintf(__('Sale voided before settlement via USAePay. Reference: %s', 'usaepay-payments'), $refundReference)
+        : sprintf(__('Refunded %1$s via USAePay. Reference: %2$s', 'usaepay-payments'), \GFCommon::to_money($amount, $entry['currency']), $refundReference),
+    ]);
+    wp_send_json_success(['message' => $action === 'void' ? __('Voided.', 'usaepay-payments') : __('Refunded.', 'usaepay-payments')]);
+  }
+
+  // ---------------------------------------------------------------------
+  // Assets
+  // ---------------------------------------------------------------------
+
+  public function scripts() {
+    $plugin = Plugin::instance();
+    $settings = $plugin->settings();
+    $scripts = [
+      [
+        'handle' => 'usaepay-payjs',
+        'src' => $plugin->url('assets/js/usaepay-payjs.js'),
+        'version' => $plugin->assetVersion('assets/js/usaepay-payjs.js'),
+        'deps' => [],
+        'in_footer' => TRUE,
+        'enqueue' => [['field_types' => [CardField::TYPE]]],
+      ],
+      [
+        'handle' => 'usaepay_gravityforms',
+        'src' => $plugin->url('assets/js/usaepay-gravityforms.js'),
+        'version' => $plugin->assetVersion('assets/js/usaepay-gravityforms.js'),
+        'deps' => ['usaepay-payjs', 'gform_gravityforms'],
+        'in_footer' => TRUE,
+        'strings' => [
+          'publicKey' => $settings->publicKey(),
+          'payJsUrl' => $settings->payJsUrl(),
+          'configured' => $settings->isConfigured() ? '1' : '0',
+          'applePay' => [
+            'enabled' => $settings->applePayEnabled() ? '1' : '0',
+            'displayName' => $settings->applePayDisplayName(),
+            'countryCode' => 'US',
+            'currencyCode' => \GFCommon::get_currency(),
+          ],
+          'i18n' => [
+            'notConfigured' => __('The payment form is not configured correctly, so no charge was made. Please contact us.', 'usaepay-payments'),
+            'chooseAmount' => __('Please choose an amount before paying with Apple Pay.', 'usaepay-payments'),
+          ],
+        ],
+        'enqueue' => [['field_types' => [CardField::TYPE]]],
+      ],
+      [
+        'handle' => 'usaepay_gravityforms_admin',
+        'src' => $plugin->url('assets/js/usaepay-gravityforms-admin.js'),
+        'version' => $plugin->assetVersion('assets/js/usaepay-gravityforms-admin.js'),
+        'deps' => ['jquery'],
+        'strings' => [
+          'ajaxUrl' => admin_url('admin-ajax.php'),
+          'confirm' => __('Refund this payment through USAePay? This cannot be undone.', 'usaepay-payments'),
+          'working' => __('Contacting USAePay…', 'usaepay-payments'),
+        ],
+        'enqueue' => [['admin_page' => ['entry_view']]],
+      ],
+    ];
+    return array_merge(parent::scripts(), $scripts);
+  }
+
+  public function styles() {
+    $plugin = Plugin::instance();
+    $styles = [
+      [
+        'handle' => 'usaepay-payments',
+        'src' => $plugin->url('assets/css/usaepay-payments.css'),
+        'version' => $plugin->assetVersion('assets/css/usaepay-payments.css'),
+        'enqueue' => [
+          ['field_types' => [CardField::TYPE]],
+          ['admin_page' => ['form_editor']],
+        ],
+      ],
+    ];
+    return array_merge(parent::styles(), $styles);
+  }
+
+  // ---------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------
+
+  /**
+   * Run a charge with the shared failure handling.
+   *
+   * @return array{response?: array, error?: string}
+   */
+  public function charge(callable $call, ?string $orderId): array {
+    try {
+      $client = $this->gateway()->client(self::INTEGRATION);
+    }
+    catch (GatewayException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      return ['error' => __('The payment system is not configured correctly, so no charge was made. Please contact us so we can fix it.', 'usaepay-payments')];
+    }
+    try {
+      $response = $call($client);
+    }
+    catch (AmbiguousGatewayException $e) {
+      $this->log_error(__METHOD__ . '(): ambiguous: ' . $e->getMessage());
+      $found = NULL;
+      if ($orderId !== NULL) {
+        try {
+          $found = $client->findTransactionByOrderId($orderId);
+        }
+        catch (\Throwable $lookup) {
+          $this->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
+        }
+      }
+      if ($found && Gateway::approved($found)) {
+        $this->log_debug(__METHOD__ . '(): reconciled ' . $orderId . ' to ' . rgar($found, 'key'));
+        $response = $found;
+      }
+      else {
+        return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments')];
+      }
+    }
+    catch (GatewayException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      return ['error' => \Usaepay\DonorMessage::donorText($e->getMessage())];
+    }
+    catch (\InvalidArgumentException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      return ['error' => __('The payment could not be processed. Please check the card details and try again, or contact us for help.', 'usaepay-payments')];
+    }
+    if (!Gateway::approved($response)) {
+      $failure = Gateway::failure($response);
+      $this->log_error(__METHOD__ . '(): declined: ' . $failure['gateway']);
+      return ['error' => $failure['donor']];
+    }
+    return ['response' => $response];
+  }
+
+  private function postedPaymentKey(array $form): string {
+    $field = $this->get_credit_card_field($form);
+    return $field ? trim((string) rgpost('input_' . $field->id)) : '';
+  }
+
+  private function submissionId(array $form): string {
+    $unique = (string) rgpost('gform_unique_id');
+    if ($unique === '' || !preg_match('/^[a-f0-9]{32}$/i', $unique)) {
+      $unique = \GFFormsModel::get_form_unique_id((int) $form['id']);
+    }
+    return strtolower($unique);
+  }
+
+  private function description(array $form, array $feed): string {
+    $title = trim((string) rgar($form, 'title'));
+    $feedName = trim((string) rgars($feed, 'meta/feedName'));
+    return $feedName !== '' && $feedName !== $title ? $title . ' - ' . $feedName : $title;
+  }
+
+  /**
+   * @return array{email: string, first_name: string, last_name: string, address: string, address2: string, city: string, state: string, postcode: string, country: string, phone: string}
+   */
+  private function payer(array $submission_data): array {
+    return [
+      'email' => (string) rgar($submission_data, 'email'),
+      'first_name' => (string) rgar($submission_data, 'first_name'),
+      'last_name' => (string) rgar($submission_data, 'last_name'),
+      'address' => (string) rgar($submission_data, 'address'),
+      'address2' => (string) rgar($submission_data, 'address2'),
+      'city' => (string) rgar($submission_data, 'city'),
+      'state' => (string) rgar($submission_data, 'state'),
+      'postcode' => (string) rgar($submission_data, 'zip'),
+      'country' => (string) rgar($submission_data, 'country'),
+      'phone' => (string) rgar($submission_data, 'phone'),
+    ];
+  }
+
+  public function gatewayNote(array $response): string {
+    $parts = [sprintf(__('USAePay reference %s', 'usaepay-payments'), Gateway::transactionReference($response))];
+    if (rgar($response, 'refnum')) {
+      $parts[] = sprintf(__('refnum %s', 'usaepay-payments'), rgar($response, 'refnum'));
+    }
+    if (rgar($response, 'authcode')) {
+      $parts[] = sprintf(__('auth code %s', 'usaepay-payments'), rgar($response, 'authcode'));
+    }
+    $avs = rgars($response, 'avs/result');
+    if ($avs) {
+      $parts[] = sprintf(__('AVS: %s', 'usaepay-payments'), $avs);
+    }
+    $cvc = rgars($response, 'cvc/result');
+    if ($cvc) {
+      $parts[] = sprintf(__('CVV: %s', 'usaepay-payments'), $cvc);
+    }
+    if (Plugin::instance()->settings()->isSandbox()) {
+      $parts[] = __('SANDBOX transaction', 'usaepay-payments');
+    }
+    return implode(', ', $parts) . '.';
+  }
+
+  public static function money(float $amount): string {
+    return number_format($amount, 2, '.', '');
+  }
+
+  public static function summary(array $card): string {
+    if (empty($card['last4'])) {
+      return $card['brand'] ? (string) $card['brand'] : __('Card', 'usaepay-payments');
+    }
+    return sprintf(__('%1$s ending in %2$s', 'usaepay-payments'), $card['brand'] ?: __('Card', 'usaepay-payments'), $card['last4']);
+  }
+
+}
