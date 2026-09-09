@@ -442,14 +442,12 @@ final class AddOn extends \GFPaymentAddOn {
     if ($amount <= 0 || $amount > $paid + 0.00001) {
       wp_send_json_error(['message' => __('Enter an amount between 0.01 and the amount paid.', 'usaepay-payments')]);
     }
+    // Refund against the host the sale was made on, whatever the site's mode is now.
     $mode = (string) gform_get_meta($entry_id, 'usaepay_mode');
-    if ($mode !== '' && $mode !== Plugin::instance()->settings()->mode()) {
-      wp_send_json_error(['message' => sprintf(__('This payment was made in %s mode; switch USAePay to that mode to refund it.', 'usaepay-payments'), $mode)]);
-    }
     $reference = (string) (gform_get_meta($entry_id, 'usaepay_transaction_key') ?: rgar($entry, 'transaction_id'));
 
     try {
-      $client = $this->gateway()->client(self::INTEGRATION);
+      $client = $this->gateway()->client(self::INTEGRATION, $mode !== '' ? $mode : NULL);
       $transaction = $client->getTransaction($reference);
       $status = (string) rgar($transaction, 'status_code');
       $full = abs($amount - $paid) < 0.005;
@@ -465,7 +463,7 @@ final class AddOn extends \GFPaymentAddOn {
         $action = 'refund';
       }
     }
-    catch (GatewayException $e) {
+    catch (GatewayException | \InvalidArgumentException $e) {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
       wp_send_json_error(['message' => $e->getMessage()]);
     }
@@ -644,9 +642,27 @@ final class AddOn extends \GFPaymentAddOn {
       'city' => (string) rgar($submission_data, 'city'),
       'state' => (string) rgar($submission_data, 'state'),
       'postcode' => (string) rgar($submission_data, 'zip'),
-      'country' => (string) rgar($submission_data, 'country'),
+      'country' => self::countryCode((string) rgar($submission_data, 'country')),
       'phone' => (string) rgar($submission_data, 'phone'),
     ];
+  }
+
+  /**
+   * The GF address field posts the country NAME ("United States"); USAePay
+   * wants an ISO code, and the shared metadata builder drops unknown values.
+   */
+  public static function countryCode(string $country): string {
+    $country = trim($country);
+    if ($country === '' || strlen($country) <= 3) {
+      return $country;
+    }
+    if (class_exists('GF_Field_Address')) {
+      $code = (string) (new \GF_Field_Address())->get_country_code($country);
+      if ($code !== '') {
+        return $code;
+      }
+    }
+    return $country;
   }
 
   public function gatewayNote(array $response): string {

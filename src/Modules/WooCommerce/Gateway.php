@@ -63,6 +63,7 @@ final class Gateway extends \WC_Payment_Gateway {
 
     add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
     add_action('woocommerce_scheduled_subscription_payment_' . $this->id, [$this, 'scheduledSubscriptionPayment'], 10, 2);
+    add_filter('woocommerce_get_customer_payment_tokens', [$this, 'filterTokensByMode'], 10, 3);
     add_action('wp_enqueue_scripts', [$this, 'enqueueClassicAssets']);
   }
 
@@ -229,7 +230,7 @@ final class Gateway extends \WC_Payment_Gateway {
     $token = NULL;
     if ($tokenId > 0) {
       $token = \WC_Payment_Tokens::get($tokenId);
-      if (!$token || $token->get_gateway_id() !== $this->id || (int) $token->get_user_id() !== get_current_user_id()) {
+      if (!$token || $token->get_gateway_id() !== $this->id || (int) $token->get_user_id() !== get_current_user_id() || !$this->tokenUsable($token)) {
         return $this->failure(__('The saved card could not be used. Please choose another card.', 'usaepay-payments'));
       }
       $cardReference = (string) $token->get_token();
@@ -246,6 +247,9 @@ final class Gateway extends \WC_Payment_Gateway {
           return $this->failure($outcome['error']);
         }
         $cardReference = trim((string) ($outcome['response']['savedcard']['key'] ?? ''));
+        if ($cardReference === '') {
+          return $this->failure(__('The card could not be saved for future payments. Please try a different card or contact us.', 'usaepay-payments'));
+        }
         $this->rememberCard($order, $outcome['response'], $cardReference, $saveCard, $token);
       }
       else {
@@ -272,11 +276,23 @@ final class Gateway extends \WC_Payment_Gateway {
     if ($newReference !== '') {
       $cardReference = $newReference;
     }
+    if ($cardReference === '' && $this->orderNeedsCardOnFile($order)) {
+      // Approved, but nothing to charge on renewal: undo the sale rather than
+      // start a subscription that can never renew.
+      $this->log('Order ' . $order->get_id() . ' contains a subscription but USAePay returned no saved card; voiding.', 'error');
+      $this->voidQuietly($reference, $order);
+      return $this->failure(__('The card could not be saved for future payments. Please try a different card or contact us.', 'usaepay-payments'));
+    }
+    $card = Shared::card($response);
+    if ($token && (empty($card['brand']) || empty($card['last4']))) {
+      // Card-on-file sales echo little card data; fall back to the token.
+      $card = ['brand' => $card['brand'] ?: ucfirst((string) $token->get_card_type()), 'last4' => $card['last4'] ?: (string) $token->get_last4()];
+    }
 
     $order->update_meta_data(self::META_TRANSACTION, $reference);
     $order->update_meta_data(self::META_REFNUM, (string) ($response['refnum'] ?? ''));
     $order->update_meta_data(self::META_MODE, $this->settings()->mode());
-    $order->update_meta_data(self::META_CARD_SUMMARY, self::summary(Shared::card($response) + ($token ? ['brand' => $token->get_card_type(), 'last4' => $token->get_last4()] : [])));
+    $order->update_meta_data(self::META_CARD_SUMMARY, self::summary($card));
     $this->rememberCard($order, $response, $cardReference, $saveCard && $newReference !== '', $token);
     $order->add_order_note($this->gatewayNote($response));
     $order->payment_complete($reference);
@@ -325,6 +341,8 @@ final class Gateway extends \WC_Payment_Gateway {
     $token->set_last4((string) ($card['last4'] ?: '0000'));
     $token->set_expiry_month($month);
     $token->set_expiry_year($year);
+    // A sandbox reference is useless against the live host and vice versa.
+    $token->add_meta_data('_usaepay_mode', $this->settings()->mode(), TRUE);
     try {
       $token->save();
       return $token;
@@ -351,11 +369,61 @@ final class Gateway extends \WC_Payment_Gateway {
     return ['12', (string) ((int) gmdate('Y') + 10)];
   }
 
+  /**
+   * Orders that create or renew a subscription must leave a card on file.
+   */
+  private function orderNeedsCardOnFile(\WC_Order $order): bool {
+    return function_exists('wcs_order_contains_subscription') && wcs_order_contains_subscription($order, ['parent', 'renewal', 'resubscribe', 'switch']);
+  }
+
+  /**
+   * A token saved in the other mode (sandbox vs live) must not be offered or charged.
+   */
+  private function tokenUsable(\WC_Payment_Token $token): bool {
+    $mode = (string) $token->get_meta('_usaepay_mode');
+    return $mode === '' || $mode === $this->settings()->mode();
+  }
+
+  /**
+   * woocommerce_get_customer_payment_tokens: hide our tokens from the other mode.
+   */
+  public function filterTokensByMode($tokens, $customer_id, $gateway_id) {
+    if (!is_array($tokens)) {
+      return $tokens;
+    }
+    foreach ($tokens as $key => $token) {
+      if ($token instanceof \WC_Payment_Token && $token->get_gateway_id() === $this->id && !$this->tokenUsable($token)) {
+        unset($tokens[$key]);
+      }
+    }
+    return $tokens;
+  }
+
+  private function voidQuietly(string $reference, ?\WC_Order $order): void {
+    if ($reference === '') {
+      return;
+    }
+    try {
+      $void = $this->shared()->client(self::INTEGRATION)->void($reference);
+      if ($order) {
+        $order->add_order_note(Shared::approved($void)
+          ? sprintf(__('USAePay sale %s voided: no saved card reference was returned.', 'usaepay-payments'), $reference)
+          : sprintf(__('USAePay sale %1$s could NOT be voided (%2$s); void it in the console.', 'usaepay-payments'), $reference, Shared::failure($void)['gateway']));
+      }
+    }
+    catch (\Throwable $e) {
+      $this->log('Void failed for ' . $reference . ': ' . $e->getMessage(), 'error');
+      if ($order) {
+        $order->add_order_note(sprintf(__('USAePay sale %1$s could NOT be voided (%2$s); void it in the console.', 'usaepay-payments'), $reference, $e->getMessage()));
+      }
+    }
+  }
+
   private function shouldSaveCard(\WC_Order $order): bool {
     if (!$order->get_user_id()) {
       return FALSE;
     }
-    if (function_exists('wcs_order_contains_subscription') && (wcs_order_contains_subscription($order, ['parent', 'renewal', 'resubscribe', 'switch']))) {
+    if ($this->orderNeedsCardOnFile($order)) {
       return TRUE;
     }
     if (!$this->savedCardsEnabled()) {
@@ -418,10 +486,8 @@ final class Gateway extends \WC_Payment_Gateway {
     if ($reference === '') {
       return new \WP_Error('usaepay', __('This order has no USAePay transaction reference.', 'usaepay-payments'));
     }
-    $mode = (string) $order->get_meta(self::META_MODE);
-    if ($mode !== '' && $mode !== $this->settings()->mode()) {
-      return new \WP_Error('usaepay', sprintf(__('This payment was made in %s mode; switch USAePay to that mode to refund it.', 'usaepay-payments'), $mode));
-    }
+    // Refund against the host the sale was made on, whatever the site's mode is now.
+    $mode = (string) $order->get_meta(self::META_MODE) ?: $this->settings()->mode();
     $amount = $amount === NULL ? (float) $order->get_total() : (float) $amount;
     // wc_create_refund() has already saved this refund, so get_total_refunded()
     // includes it; anything beyond $amount was refunded earlier.
@@ -429,7 +495,7 @@ final class Gateway extends \WC_Payment_Gateway {
     $full = abs($amount - (float) $order->get_total()) < 0.005 && $previouslyRefunded < 0.005;
 
     try {
-      $client = $this->shared()->client(self::INTEGRATION);
+      $client = $this->shared()->client(self::INTEGRATION, $mode);
       $transaction = $client->getTransaction($reference);
       $status = (string) ($transaction['status_code'] ?? '');
       if ($status === 'P' || $status === 'A') {
@@ -498,24 +564,63 @@ final class Gateway extends \WC_Payment_Gateway {
       $order->payment_complete();
       return;
     }
-    $orderId = 'wc-' . $order->get_id() . '-' . (int) $order->get_meta('_usaepay_renewal_attempts');
+    if ($order->is_paid() || trim((string) $order->get_meta(self::META_TRANSACTION)) !== '') {
+      return;
+    }
+    // An earlier attempt may have been charged without a readable response
+    // (timeout, fatal): look every previous orderid up before charging again.
+    $attempts = (int) $order->get_meta('_usaepay_renewal_attempts');
+    for ($i = 0; $i < $attempts; $i++) {
+      $found = $this->findApproved('wc-' . $order->get_id() . '-' . $i);
+      if ($found) {
+        $order->add_order_note(sprintf(__('USAePay: attempt %d had already been charged; recorded without charging again.', 'usaepay-payments'), $i + 1));
+        $this->completeRenewal($order, $found);
+        return;
+      }
+    }
+    $orderId = 'wc-' . $order->get_id() . '-' . $attempts;
     $metadata = $this->metadata($order, $orderId);
     unset($metadata['clientip']);
-    $order->update_meta_data('_usaepay_renewal_attempts', (int) $order->get_meta('_usaepay_renewal_attempts') + 1);
+    $order->update_meta_data('_usaepay_renewal_attempts', $attempts + 1);
     $order->save();
 
     $outcome = $this->charge(static fn($client) => $client->saleWithCardReference($cardReference, self::money($amount), $metadata), $orderId, $order);
+    if (!empty($outcome['ambiguous'])) {
+      // Leave the order pending: a "failed" status would make Subscriptions
+      // retry, and the charge may have gone through. The next run (or an
+      // admin "Retry payment") reconciles via the loop above.
+      $order->add_order_note(__('USAePay did not answer conclusively; the order is left pending and will be reconciled before any new charge.', 'usaepay-payments'));
+      return;
+    }
     if (!empty($outcome['error'])) {
       $order->update_status('failed', sprintf(__('USAePay renewal charge failed: %s', 'usaepay-payments'), $outcome['gateway'] ?? $outcome['error']));
       return;
     }
-    $response = $outcome['response'];
+    $this->completeRenewal($order, $outcome['response']);
+  }
+
+  private function completeRenewal(\WC_Order $order, array $response): void {
     $reference = Shared::transactionReference($response);
     $order->update_meta_data(self::META_TRANSACTION, $reference);
     $order->update_meta_data(self::META_REFNUM, (string) ($response['refnum'] ?? ''));
     $order->update_meta_data(self::META_MODE, $this->settings()->mode());
     $order->add_order_note($this->gatewayNote($response));
     $order->payment_complete($reference);
+  }
+
+  /**
+   * The approved transaction carrying this orderid, or NULL when none is
+   * listed among the newest transactions or the lookup itself fails.
+   */
+  private function findApproved(string $orderId): ?array {
+    try {
+      $found = $this->shared()->client(self::INTEGRATION)->findTransactionByOrderId($orderId);
+    }
+    catch (\Throwable $e) {
+      $this->log('Reconciliation lookup failed for ' . $orderId . ': ' . $e->getMessage(), 'error');
+      return NULL;
+    }
+    return $found && Shared::approved($found) ? $found : NULL;
   }
 
   /**
@@ -529,7 +634,7 @@ final class Gateway extends \WC_Payment_Gateway {
     $token = NULL;
     if ($tokenId > 0) {
       $token = \WC_Payment_Tokens::get($tokenId);
-      if (!$token || $token->get_gateway_id() !== $this->id || (int) $token->get_user_id() !== (int) $subscription->get_user_id()) {
+      if (!$token || $token->get_gateway_id() !== $this->id || (int) $token->get_user_id() !== (int) $subscription->get_user_id() || !$this->tokenUsable($token)) {
         return $this->failure(__('The saved card could not be used. Please choose another card.', 'usaepay-payments'));
       }
       $cardReference = (string) $token->get_token();
@@ -538,7 +643,8 @@ final class Gateway extends \WC_Payment_Gateway {
       return $this->failure(__('Please enter your card details.', 'usaepay-payments'));
     }
     else {
-      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $this->metadata($subscription, 'wc-sub-' . $subscription->get_id())), NULL, $subscription);
+      $metadata = $this->metadata($subscription, 'wc-sub-' . $subscription->get_id());
+      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $metadata), NULL, $subscription);
       if (!empty($outcome['error'])) {
         return $this->failure($outcome['error']);
       }
@@ -593,7 +699,7 @@ final class Gateway extends \WC_Payment_Gateway {
         if ($order) {
           $order->add_order_note(sprintf(__('USAePay did not answer conclusively (%s). Check the console before retrying.', 'usaepay-payments'), $e->getMessage()));
         }
-        return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'), 'gateway' => $e->getMessage()];
+        return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'), 'gateway' => $e->getMessage(), 'ambiguous' => TRUE];
       }
       $response = $found;
     }

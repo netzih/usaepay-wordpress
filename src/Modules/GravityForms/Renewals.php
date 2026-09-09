@@ -70,10 +70,20 @@ final class Renewals {
         ['key' => 'payment_status', 'operator' => 'in', 'value' => ['Active', 'Failed']],
       ],
     ];
-    $entries = \GFAPI::get_entries(0, $criteria, ['key' => 'id', 'direction' => 'ASC'], ['offset' => 0, 'page_size' => 500]);
-    if (is_wp_error($entries)) {
-      $this->addon->log_error(__METHOD__ . '(): ' . $entries->get_error_message());
-      return [];
+    // Page through every matching entry: a single fixed page would silently
+    // leave newer subscriptions uncharged once a site outgrows it.
+    $entries = [];
+    $pageSize = 200;
+    for ($offset = 0; $offset < 100000; $offset += $pageSize) {
+      $page = \GFAPI::get_entries(0, $criteria, ['key' => 'id', 'direction' => 'ASC'], ['offset' => $offset, 'page_size' => $pageSize]);
+      if (is_wp_error($page)) {
+        $this->addon->log_error(__METHOD__ . '(): ' . $page->get_error_message());
+        break;
+      }
+      $entries = array_merge($entries, $page);
+      if (count($page) < $pageSize) {
+        break;
+      }
     }
     $due = [];
     foreach ($entries as $entry) {
@@ -142,21 +152,27 @@ final class Renewals {
       // Renewals run without a browser; the stored IP would be misleading.
       unset($metadata['clientip']);
       $reference = (string) $meta('usaepay_card_reference');
+      $pendingOrderId = (string) $meta('usaepay_reconcile_order_id');
 
-      $client = $this->gateway->client(AddOn::INTEGRATION);
       try {
+        $client = $this->gateway->client(AddOn::INTEGRATION);
+        if ($pendingOrderId !== '') {
+          // A previous run sent a charge and never read the answer: find out
+          // what happened before sending another one.
+          $found = $this->findApproved($client, $pendingOrderId);
+          gform_update_meta($id, 'usaepay_reconcile_order_id', '');
+          if ($found) {
+            $this->addon->add_note($id, sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
+            return $this->recordSuccess($entry, $found, $amount, $scheduled, $start ?? $scheduled, $index, $now, $length, $unit, $made, $times);
+          }
+        }
         $response = $client->saleWithCardReference($reference, AddOn::money($amount), $metadata);
       }
       catch (AmbiguousGatewayException $e) {
         $this->addon->log_error(__METHOD__ . "(): entry #$id ambiguous: " . $e->getMessage());
-        $found = NULL;
-        try {
-          $found = $client->findTransactionByOrderId($orderId);
-        }
-        catch (\Throwable $lookup) {
-          $this->addon->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
-        }
+        $found = $this->findApproved($client, $orderId);
         if (!$found) {
+          gform_update_meta($id, 'usaepay_reconcile_order_id', $orderId);
           $this->addon->add_note($id, sprintf(__('USAePay did not answer when charging installment %1$s (attempt %2$d). It will be checked again next hour before any retry.', 'usaepay-payments'), $scheduled->format('Y-m-d'), $attempt + 1), 'error');
           return 'ambiguous';
         }
@@ -164,6 +180,12 @@ final class Renewals {
       }
       catch (GatewayException $e) {
         $response = ['result_code' => 'E', 'error' => $e->getMessage()] + $e->getResponseData();
+      }
+      catch (\Throwable $e) {
+        // Misconfiguration or a coding error must not kill the whole cron run.
+        $this->addon->log_error(__METHOD__ . "(): entry #$id: " . $e->getMessage());
+        $this->addon->add_note($id, sprintf(__('USAePay renewal skipped: %s', 'usaepay-payments'), $e->getMessage()), 'error');
+        return 'skipped';
       }
 
       if (Gateway::approved($response)) {
@@ -174,6 +196,21 @@ final class Renewals {
     finally {
       delete_transient($lockKey);
     }
+  }
+
+  /**
+   * The approved transaction carrying this orderid, or NULL when none is
+   * listed or the lookup itself fails.
+   */
+  private function findApproved(\Usaepay\GatewayClient $client, string $orderId): ?array {
+    try {
+      $found = $client->findTransactionByOrderId($orderId);
+    }
+    catch (\Throwable $lookup) {
+      $this->addon->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
+      return NULL;
+    }
+    return $found && Gateway::approved($found) ? $found : NULL;
   }
 
   private function recordSuccess(array $entry, array $response, float $amount, \DateTimeImmutable $scheduled, \DateTimeImmutable $start, int $index, \DateTimeImmutable $now, int $length, string $unit, int $made, int $times): string {

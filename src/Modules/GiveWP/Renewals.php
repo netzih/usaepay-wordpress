@@ -84,7 +84,7 @@ final class Renewals {
       Log::debug('GiveWP renewal skipped: subscription mode differs from current test-mode setting', ['subscription' => $id]);
       return 'skipped';
     }
-    if (!$subscription->isIndefinite() && $subscription->hasExceededTheMaxInstallments()) {
+    if ($this->installmentsDone($subscription)) {
       $subscription->status = SubscriptionStatus::COMPLETED();
       $subscription->save();
       SubscriptionNote::create(['subscriptionId' => $id, 'content' => __('All scheduled donations have been made.', 'usaepay-payments')]);
@@ -126,21 +126,29 @@ final class Renewals {
       $metadata = Plugin::instance()->gateway()->metadata($invoice, (string) ($initial ? $initial->formTitle : __('Recurring donation', 'usaepay-payments')), $payer, ['currency' => $currency, 'orderid' => $orderId]);
       unset($metadata['clientip']);
       $amount = $subscription->amount->formatToDecimal();
+      $pendingOrderId = (string) ($state['reconcile'] ?? '');
 
-      $client = Plugin::instance()->gateway()->client(Gateway::INTEGRATION, Gateway::mode());
       try {
+        $client = Plugin::instance()->gateway()->client(Gateway::INTEGRATION, Gateway::mode());
+        if ($pendingOrderId !== '') {
+          // A previous run sent a charge and never read the answer: find out
+          // what happened before sending another one.
+          $found = $this->findApproved($client, $pendingOrderId);
+          unset($state['reconcile']);
+          $this->saveState($id, $state ?: NULL);
+          if ($found) {
+            SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)]);
+            return $this->recordSuccess($subscription, $found, $installment);
+          }
+        }
         $response = $client->saleWithCardReference((string) $subscription->gatewaySubscriptionId, $amount, $metadata);
       }
       catch (AmbiguousGatewayException $e) {
         Log::error('GiveWP renewal ambiguous', ['subscription' => $id, 'error' => $e->getMessage()]);
-        $found = NULL;
-        try {
-          $found = $client->findTransactionByOrderId($orderId);
-        }
-        catch (\Throwable $lookup) {
-          Log::error('GiveWP renewal reconciliation failed', ['error' => $lookup->getMessage()]);
-        }
+        $found = $this->findApproved($client, $orderId);
         if (!$found) {
+          $state['reconcile'] = $orderId;
+          $this->saveState($id, $state);
           SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay did not answer when charging the renewal due %1$s (attempt %2$d). It will be checked again next hour before any retry.', 'usaepay-payments'), $installment, $attempt + 1)]);
           return 'ambiguous';
         }
@@ -148,6 +156,12 @@ final class Renewals {
       }
       catch (GatewayException $e) {
         $response = ['result_code' => 'E', 'error' => $e->getMessage()] + $e->getResponseData();
+      }
+      catch (\Throwable $e) {
+        // Misconfiguration or a coding error must not kill the whole cron run.
+        Log::error('GiveWP renewal skipped', ['subscription' => $id, 'error' => $e->getMessage()]);
+        SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay renewal skipped: %s', 'usaepay-payments'), $e->getMessage())]);
+        return 'skipped';
       }
 
       if (Shared::approved($response)) {
@@ -167,18 +181,24 @@ final class Renewals {
       Log::debug('GiveWP renewal already recorded', ['subscription' => $id, 'transaction' => $transaction]);
       return 'skipped';
     }
+    // A retry moved renewsAt to the retry date; put the real due date back so
+    // createRenewal() advances from it and the billing anniversary stays put.
+    $state = $this->state($id);
+    if (!empty($state['renews_at'])) {
+      $subscription->renewsAt = new \DateTime((string) $state['renews_at'], wp_timezone());
+    }
+    if ($subscription->status->isFailing()) {
+      $subscription->status = SubscriptionStatus::ACTIVE();
+    }
+    $subscription->save();
     $donation = $subscription->createRenewal(['gatewayTransactionId' => $transaction]);
     DonationNote::create([
       'donationId' => $donation->id,
       'content' => sprintf(__('Renewal due %1$s charged via USAePay. %2$s', 'usaepay-payments'), $installment, (new Gateway())->gatewayNote($response)),
     ]);
-    if ($subscription->status->isFailing()) {
-      $subscription->status = SubscriptionStatus::ACTIVE();
-      $subscription->save();
-    }
     $this->saveState($id, NULL);
 
-    if (!$subscription->isIndefinite() && $subscription->hasExceededTheMaxInstallments()) {
+    if ($this->installmentsDone($subscription)) {
       $subscription->status = SubscriptionStatus::COMPLETED();
       $subscription->save();
       SubscriptionNote::create(['subscriptionId' => $id, 'content' => __('All scheduled donations have been made.', 'usaepay-payments')]);
@@ -202,12 +222,42 @@ final class Renewals {
     }
 
     $retry = $now->modify('+' . self::RETRY_DAYS . ' days');
+    $state = $this->state($id);
+    if (empty($state['renews_at']) && $subscription->renewsAt instanceof \DateTimeInterface) {
+      // Remember the real due date; renewsAt is about to hold the retry date.
+      $state['renews_at'] = $subscription->renewsAt->format('Y-m-d H:i:s');
+    }
     $subscription->status = SubscriptionStatus::FAILING();
     $subscription->renewsAt = \DateTime::createFromImmutable($retry);
     $subscription->save();
-    $this->saveState($id, ['attempts' => $attempt, 'installment' => $installment]);
+    $this->saveState($id, ['attempts' => $attempt, 'installment' => $installment, 'renews_at' => $state['renews_at'] ?? NULL]);
     SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('Renewal due %1$s declined (attempt %2$d of %3$d): %4$s. Next attempt %5$s.', 'usaepay-payments'), $installment, $attempt, self::MAX_ATTEMPTS, $failure['gateway'], $retry->format('Y-m-d H:i'))]);
     return 'declined';
+  }
+
+  /**
+   * GiveWP's own end condition (Subscription::shouldEndSubscription): the
+   * initial donation plus renewals has reached the installment count.
+   * hasExceededTheMaxInstallments() is strictly "greater than" and would let
+   * one installment too many through.
+   */
+  private function installmentsDone(Subscription $subscription): bool {
+    return !$subscription->isIndefinite() && $subscription->totalDonations() >= (int) $subscription->installments;
+  }
+
+  /**
+   * The approved transaction carrying this orderid, or NULL when none is
+   * listed or the lookup itself fails.
+   */
+  private function findApproved(\Usaepay\GatewayClient $client, string $orderId): ?array {
+    try {
+      $found = $client->findTransactionByOrderId($orderId);
+    }
+    catch (\Throwable $lookup) {
+      Log::error('GiveWP renewal reconciliation failed', ['error' => $lookup->getMessage()]);
+      return NULL;
+    }
+    return $found && Shared::approved($found) ? $found : NULL;
   }
 
   private function state(int $subscriptionId): array {

@@ -126,8 +126,10 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
     if ($reference === '') {
       throw new PaymentGatewayException(__('This donation has no USAePay transaction reference.', 'usaepay-payments'));
     }
+    // Refund against the host the donation was made on, whatever Test Mode is now.
+    $mode = isset($donation->mode) && method_exists($donation->mode, 'isLive') ? ($donation->mode->isLive() ? 'live' : 'sandbox') : self::mode();
     try {
-      $client = $this->shared()->client(self::INTEGRATION, self::mode());
+      $client = $this->shared()->client(self::INTEGRATION, $mode);
       $transaction = $client->getTransaction($reference);
       $status = (string) ($transaction['status_code'] ?? '');
       if ($status === 'P' || $status === 'A') {
