@@ -1,0 +1,23 @@
+{
+  "name": "chabadrichmond/usaepay-php",
+  "description": "Framework-free USAePay REST v2 client with Pay.js token, saved card, void/refund and donor-facing error wording",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5"
+  },
+  "autoload": {
+    "psr-4": { "Usaepay\\": "src/" }
+  },
+  "autoload-dev": {
+    "psr-4": { "Usaepay\\Tests\\": "tests/" }
+  },
+  "scripts": {
+    "test": "phpunit"
+  }
+}
