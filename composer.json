@@ -1,0 +1,30 @@
+{
+  "name": "chabadrichmond/usaepay-payments",
+  "description": "USAePay payment gateway for Gravity Forms, GiveWP and WooCommerce (Pay.js tokenization, saved cards, site-managed recurring)",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0-or-later",
+  "require": {
+    "php": ">=8.1",
+    "chabadrichmond/usaepay-php": "dev-main"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5"
+  },
+  "repositories": [
+    { "type": "path", "url": "../usaepay-php", "options": { "symlink": true } }
+  ],
+  "autoload": {
+    "psr-4": { "Usaepay\\WordPress\\": "src/" }
+  },
+  "autoload-dev": {
+    "psr-4": { "Usaepay\\WordPress\\Tests\\": "tests/" }
+  },
+  "config": {
+    "platform": { "php": "8.1.0" },
+    "sort-packages": true
+  },
+  "scripts": {
+    "test": "phpunit",
+    "build": "COMPOSER_MIRROR_PATH_REPOS=1 composer install --no-dev --prefer-dist --optimize-autoloader"
+  }
+}

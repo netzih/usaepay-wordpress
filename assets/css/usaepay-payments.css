@@ -1,0 +1,34 @@
+/* The Pay.js iframe is sized as height:100% of its container, and the card
+   row inside it is a single flex line, so the container needs a fixed height
+   or the iframe falls back to the browser default of 150px. */
+.usaepay-card-element {
+  box-sizing: border-box;
+  height: 44px;
+  max-width: 520px;
+  padding: 0 8px;
+  border: 1px solid #8c8f94;
+  border-radius: 4px;
+  background: #fff;
+  overflow: hidden;
+}
+.usaepay-card-element iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.usaepay-card-element:focus-within {
+  border-color: #2271b1;
+  box-shadow: 0 0 0 1px #2271b1;
+}
+.usaepay-card-errors { max-width: 520px; margin-top: 8px; color: #b32d2e; }
+.usaepay-card-errors:empty { display: none; }
+.usaepay-card-note { max-width: 520px; margin-top: 8px; font-size: 0.9em; opacity: 0.8; }
+
+.usaepay-apple-pay { max-width: 520px; margin-bottom: 12px; }
+.usaepay-apple-pay[hidden] { display: none; }
+.usaepay-apple-pay-button { min-height: 40px; }
+.usaepay-apple-pay-button .apple-pay-button { width: 100%; height: 44px; border-radius: 4px; cursor: pointer; }
+.usaepay-apple-pay-divider { display: flex; align-items: center; margin: 12px 0 0; color: #646970; font-size: 0.9em; }
+.usaepay-apple-pay-divider::before, .usaepay-apple-pay-divider::after { content: ""; flex: 1; border-top: 1px solid #c3c4c7; }
+.usaepay-apple-pay-divider span { padding: 0 10px; }
