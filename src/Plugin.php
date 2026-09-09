@@ -64,6 +64,31 @@ final class Plugin {
     add_filter('give_get_settings_gateways', [$this, 'giveSettingsFields']);
     add_action(self::CRON_GIVEWP, [$this, 'runGiveRenewals']);
     add_action('init', [$this, 'scheduleGiveRenewals']);
+
+    // WooCommerce: gateway class, block checkout support, feature compatibility.
+    add_filter('woocommerce_payment_gateways', [$this, 'wooGateways']);
+    add_action('woocommerce_blocks_payment_method_type_registration', [$this, 'wooBlocks']);
+    add_action('before_woocommerce_init', [$this, 'wooCompatibility']);
+  }
+
+  public function wooGateways(array $gateways): array {
+    if (class_exists('WC_Payment_Gateway')) {
+      $gateways[] = Modules\WooCommerce\Gateway::class;
+    }
+    return $gateways;
+  }
+
+  public function wooBlocks($registry): void {
+    if (class_exists('\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType')) {
+      $registry->register(new Modules\WooCommerce\BlocksSupport());
+    }
+  }
+
+  public function wooCompatibility(): void {
+    if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
+      \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', $this->file, TRUE);
+      \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('cart_checkout_blocks', $this->file, TRUE);
+    }
   }
 
   public const CRON_GIVEWP = 'usaepay_givewp_renewals';

@@ -1,7 +1,7 @@
 # USAePay Payments for WordPress
 
-One plugin, one USAePay account, three integrations: **Gravity Forms** and
-**GiveWP** (done), WooCommerce (planned). Card details are entered in USAePay's hosted
+One plugin, one USAePay account, three integrations: **Gravity Forms**,
+**GiveWP** and **WooCommerce**. Card details are entered in USAePay's hosted
 Pay.js fields; this site only ever handles single-use payment keys and
 saved-card references.
 
@@ -74,10 +74,35 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 - Cancelling a subscription in GiveWP stops further charges; nothing is
   scheduled at USAePay so there is nothing else to cancel.
 
+## WooCommerce
+
+- Enable **USAePay** under WooCommerce > Settings > Payments. Title, description
+  and the saved-cards switch live there; credentials and sandbox/live under
+  Settings > USAePay. Compatible with HPOS and the block checkout.
+- Block checkout, classic checkout, Pay for Order and My Account > Add Payment
+  Method all share one server path: the block checkout copies its payment data
+  into `$_POST`, so `process_payment()` reads `usaepay_payment_key` and
+  `wc-usaepay-payment-token` the same way everywhere.
+- Saved cards are `WC_Payment_Token_CC` rows holding the USAePay saved-card
+  reference (brand, last four and expiry for display). Logged-in customers can
+  tick "save card"; a cart containing a subscription always saves it.
+- Orders get a note with the USAePay reference, auth code, AVS and CVV results,
+  plus meta `_usaepay_transaction_key`, `_usaepay_refnum`, `_usaepay_mode`,
+  `_usaepay_card_reference`, `_usaepay_card_summary`. Declines add a note with
+  the gateway text and show payer wording at checkout.
+- Refunds from the order screen ("Refund via USAePay"): unsettled sales are
+  voided in full, settled ones refunded in full or in part. Partial refunds of
+  an unsettled sale are refused with an explanation.
+- WooCommerce Subscriptions (add-on, untested here): renewals are charged from
+  `woocommerce_scheduled_subscription_payment_usaepay` against the card
+  reference copied onto the subscription; card changes by customer or admin go
+  through the same checkout fields and verify the card with a $1 authorization
+  that is voided at once. Free trials verify the card the same way.
+
 ### Conventions shared with the CiviCRM import
 
 Every charge sends `custid` = payer email, `invoice` = `GF<form>-<submission>`
-(one-time) or `GF-<entry>` (renewals), `GIVE-<donation>` / `GIVE-S<subscription>` for GiveWP, `orderid` = an idempotency reference
+(one-time) or `GF-<entry>` (renewals), `GIVE-<donation>` / `GIVE-S<subscription>` for GiveWP, `WC-<order number>` for WooCommerce, `orderid` = an idempotency reference
 (`gf-<entry>-<YYYY-MM-DD>-<attempt>` for renewals) and the billing address for
 AVS. No top-level `email` is sent, so USAePay does not email its own receipt.
 
