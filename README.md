@@ -1,7 +1,7 @@
 # USAePay Payments for WordPress
 
-One plugin, one USAePay account, three integrations: **Gravity Forms** (done),
-GiveWP and WooCommerce (planned). Card details are entered in USAePay's hosted
+One plugin, one USAePay account, three integrations: **Gravity Forms** and
+**GiveWP** (done), WooCommerce (planned). Card details are entered in USAePay's hosted
 Pay.js fields; this site only ever handles single-use payment keys and
 saved-card references.
 
@@ -49,10 +49,35 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
   once the domain is registered with USAePay and Apple's association file is
   served from `/.well-known/`.
 
+## GiveWP
+
+- Works with the visual donation forms (v3). Enable **USAePay** under
+  Donations > Settings > Payment Gateways > Gateways (v3 list); the **USAePay**
+  section there only points at Settings > USAePay, where the credentials live.
+- **GiveWP Test Mode selects the sandbox credentials**; live mode the live ones.
+  Subscriptions remember the mode they were created in and are skipped by the
+  renewal worker while the site is in the other mode.
+- One-time donations charge the Pay.js key in `createPayment()`; the donation
+  gets a note with the USAePay reference, auth code, AVS and CVV results.
+  Declines throw a `PaymentGatewayException` with payer wording (shown on the
+  form) and leave a note with the gateway text on the pending donation.
+- Recurring donations need no add-on for the gateway itself: the form builder
+  unlocks recurring because the gateway reports subscription support. The
+  first installment is charged with `save_card`; the saved-card reference is
+  stored as the subscription's gateway subscription id. An hourly WP-Cron event
+  (`usaepay_givewp_renewals`) charges subscriptions whose renewal date has
+  passed and records each with `Subscription::createRenewal()`, which also
+  advances the renewal date. Declines: status **Failing**, retry in 3 days, three
+  attempts, then **Cancelled**. Installment limits complete the subscription.
+- Refunds: the donation page's Refund action voids unsettled sales and refunds
+  settled ones (full amount).
+- Cancelling a subscription in GiveWP stops further charges; nothing is
+  scheduled at USAePay so there is nothing else to cancel.
+
 ### Conventions shared with the CiviCRM import
 
 Every charge sends `custid` = payer email, `invoice` = `GF<form>-<submission>`
-(one-time) or `GF-<entry>` (renewals), `orderid` = an idempotency reference
+(one-time) or `GF-<entry>` (renewals), `GIVE-<donation>` / `GIVE-S<subscription>` for GiveWP, `orderid` = an idempotency reference
 (`gf-<entry>-<YYYY-MM-DD>-<attempt>` for renewals) and the billing address for
 AVS. No top-level `email` is sent, so USAePay does not email its own receipt.
 

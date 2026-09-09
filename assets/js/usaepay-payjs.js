@@ -59,8 +59,13 @@
   /**
    * Load pay.js once; resolves when window.usaepay exists.
    */
+  function ready() {
+    // pay.js defines the global first and attaches Client a moment later.
+    return typeof usaepay !== 'undefined' && typeof usaepay.Client === 'function';
+  }
+
   function load(url) {
-    if (typeof usaepay !== 'undefined') {
+    if (ready()) {
       return Promise.resolve();
     }
     if (loading) {
@@ -77,7 +82,7 @@
       }
       var attempts = 0;
       var poll = window.setInterval(function () {
-        if (typeof usaepay !== 'undefined') {
+        if (ready()) {
           window.clearInterval(poll);
           resolve();
         } else if (++attempts > 150) {
@@ -86,7 +91,7 @@
         }
       }, 100);
       script.addEventListener('load', function () {
-        if (typeof usaepay !== 'undefined') {
+        if (ready()) {
           window.clearInterval(poll);
           resolve();
         }

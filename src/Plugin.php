@@ -55,6 +55,70 @@ final class Plugin {
 
     // Gravity Forms add-ons must be registered on gform_loaded.
     add_action('gform_loaded', [$this, 'bootGravityForms'], 5);
+
+    // GiveWP: register the gateway when GiveWP collects gateways, add a
+    // pointer section under Donations > Settings > Payment Gateways and
+    // run the renewal worker hourly.
+    add_action('givewp_register_payment_gateway', [$this, 'bootGiveWP']);
+    add_filter('give_get_sections_gateways', [$this, 'giveSettingsSection']);
+    add_filter('give_get_settings_gateways', [$this, 'giveSettingsFields']);
+    add_action(self::CRON_GIVEWP, [$this, 'runGiveRenewals']);
+    add_action('init', [$this, 'scheduleGiveRenewals']);
+  }
+
+  public const CRON_GIVEWP = 'usaepay_givewp_renewals';
+
+  public function bootGiveWP($registrar): void {
+    if (!class_exists('\Give\Framework\PaymentGateways\PaymentGateway')) {
+      return;
+    }
+    try {
+      $registrar->registerGateway(Modules\GiveWP\Gateway::class);
+    }
+    catch (\OverflowException $e) {
+      // Already registered (GiveWP fires the collection more than once).
+    }
+  }
+
+  public function giveSettingsSection(array $sections): array {
+    $sections[Modules\GiveWP\Gateway::ID] = __('USAePay', 'usaepay-payments');
+    return $sections;
+  }
+
+  public function giveSettingsFields(array $settings): array {
+    if (!function_exists('give_get_current_setting_section') || give_get_current_setting_section() !== Modules\GiveWP\Gateway::ID) {
+      return $settings;
+    }
+    $url = admin_url('options-general.php?page=' . Admin\SettingsPage::PAGE);
+    return [
+      ['type' => 'title', 'id' => 'give_title_usaepay'],
+      [
+        'name' => __('USAePay account', 'usaepay-payments'),
+        'id' => 'usaepay_pointer',
+        'type' => 'give_docs_link',
+        'url' => $url,
+        'title' => __('Open Settings > USAePay', 'usaepay-payments'),
+        'desc' => __('Credentials are shared with the other USAePay integrations on this site and are managed under Settings > USAePay. GiveWP Test Mode uses the sandbox credentials; live mode uses the live ones. Recurring donations are charged by this site every renewal date (hourly WordPress cron), nothing is scheduled in the USAePay console.', 'usaepay-payments'),
+      ],
+      ['type' => 'sectionend', 'id' => 'give_title_usaepay'],
+    ];
+  }
+
+  public function scheduleGiveRenewals(): void {
+    if (!function_exists('give')) {
+      return;
+    }
+    if (!wp_next_scheduled(self::CRON_GIVEWP)) {
+      wp_schedule_event(time() + 300, 'hourly', self::CRON_GIVEWP);
+    }
+  }
+
+  public function runGiveRenewals(): void {
+    if (!function_exists('give') || !class_exists('\Give\Subscriptions\Models\Subscription')) {
+      return;
+    }
+    $summary = (new Modules\GiveWP\Renewals())->run();
+    Log::debug('GiveWP renewals', $summary);
   }
 
   public function loadTextdomain(): void {
