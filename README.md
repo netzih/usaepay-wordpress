@@ -10,10 +10,27 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 (void unsettled / refund settled, no top-level `email`, reconciliation by
 `orderid`) is shared and unit tested once.
 
+## Installation
+
+Download `usaepay-payments-<version>.zip` from the
+[latest release](https://github.com/netzih/usaepay-wordpress/releases/latest)
+(the repository is private, so sign in to GitHub first). In WordPress go to
+**Plugins > Add New Plugin > Upload Plugin**, choose the zip, press **Install
+Now**, then **Activate**. The zip carries everything the plugin runs on,
+including the bundled USAePay client library; no Composer or shell access is
+needed on the site. To upgrade, upload the newer zip the same way and confirm
+**Replace current with uploaded** when WordPress asks.
+
+Requirements: WordPress 6.4+, PHP 8.1+ with curl and json, and at least one of
+Gravity Forms 2.9+, GiveWP 4 or WooCommerce 8 (WooCommerce Subscriptions for
+recurring WooCommerce payments).
+
+From a clone instead of a release: run `composer install` in the plugin
+directory, or `bin/build-zip.sh` to make the same zip a release ships.
+
 ## Setup
 
-1. `composer install` in the plugin directory (or use a release build).
-2. Activate **USAePay Payments**.
+1. Install and activate **USAePay Payments** (see above).
 3. **Settings > USAePay**: choose Sandbox or Live, enter the API key (source
    key), its PIN and the Pay.js public key for that mode, save, then press
    **Check credentials**. The check lists one transaction and mints an unused
@@ -204,9 +221,15 @@ sandbox mode is skipped by the renewal worker while the plugin is in live mode
 
 ```
 composer install
-vendor/bin/phpunit          # pure classes (schedule math)
+vendor/bin/phpunit          # pure classes (schedule math, Reconcile)
 composer run build          # vendor/ with the library copied, no dev deps
+bin/build-zip.sh            # build/usaepay-payments-<version>.zip for a release
 ```
+
+Releasing: bump `Version:` in `usaepay-payments.php` and `Plugin::VERSION`
+together (the second is the `?ver=` of the enqueued assets outside WP_DEBUG),
+commit, tag `v<version>`, run `bin/build-zip.sh` and attach the zip to the
+GitHub release for that tag.
 
 Browser tests live outside the repo (`~/.config/usaepayjs/browser/wp-*.mjs`,
 Playwright) and run against the local site described in the project notes.

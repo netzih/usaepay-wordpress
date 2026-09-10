@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: USAePay Payments
- * Plugin URI: https://lab.civicrm.org/Chabadrichmond
+ * Plugin URI: https://github.com/netzih/usaepay-wordpress
  * Description: Take card payments through USAePay in Gravity Forms, GiveWP and WooCommerce. Card details are entered in USAePay's hosted Pay.js fields and never touch this site.
  * Version: 0.1.1
  * Requires at least: 6.4
