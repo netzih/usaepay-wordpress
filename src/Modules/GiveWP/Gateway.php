@@ -256,7 +256,7 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
       Log::error('GiveWP: ambiguous response', ['donation' => $donation->id, 'error' => $e->getMessage()]);
       $found = NULL;
       try {
-        $found = $client->findTransactionByOrderId($orderId);
+        $found = $client->findTransactionByOrderId($orderId, time());
       }
       catch (\Throwable $lookup) {
         Log::error('GiveWP: reconciliation failed', ['error' => $lookup->getMessage()]);
@@ -279,6 +279,11 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
       Log::error('GiveWP: declined', ['donation' => $donation->id, 'gateway' => $failure['gateway']]);
       DonationNote::create(['donationId' => $donation->id, 'content' => sprintf(__('USAePay declined the card: %s', 'usaepay-payments'), $failure['gateway'])]);
       throw new PaymentGatewayException($failure['donor']);
+    }
+    if (!empty($response['void_error'])) {
+      // The card was saved, but the $1 verification hold was not released.
+      Log::error('GiveWP: verification hold not voided', ['donation' => $donation->id, 'error' => $response['void_error']]);
+      DonationNote::create(['donationId' => $donation->id, 'content' => sprintf(__('USAePay saved the card but did not void the $%1$s verification hold (%2$s). The hold expires on its own; void it in the console to release it sooner.', 'usaepay-payments'), \Usaepay\GatewayClient::CARD_VERIFICATION_AMOUNT, $response['void_error'])]);
     }
     return $response;
   }

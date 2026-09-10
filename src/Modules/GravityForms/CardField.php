@@ -83,6 +83,14 @@ final class CardField extends \GF_Field {
 
     $apple_pay = $this->applePayAllowed($form) ? '1' : '0';
     $input_id = 'input_' . $form_id . '_' . $id;
+    // On a multi-page form the card is tokenized when its page is left; the
+    // key has to ride along on the later pages, where this field is not
+    // shown. On the card's own page it starts empty so a fresh key is minted.
+    $carry = '';
+    if (is_string($value) && $value !== '' && class_exists('GFFormDisplay') && (int) $this->pageNumber > 0
+      && (int) \GFFormDisplay::get_current_page($form_id) !== (int) $this->pageNumber) {
+      $carry = $value;
+    }
 
     return '<div class="ginput_container ginput_container_usaepay_card" data-usaepay-form="' . $form_id . '" data-usaepay-field="' . $id . '">'
       . '<div class="usaepay-apple-pay" id="' . esc_attr($base) . '-apple-pay" hidden>'
@@ -91,7 +99,7 @@ final class CardField extends \GF_Field {
       . '</div>'
       . '<div class="usaepay-card-element" id="' . esc_attr($base) . '-card" data-form-id="' . $form_id . '" data-field-id="' . $id . '" data-apple-pay="' . $apple_pay . '" aria-label="' . esc_attr__('Secure card details', 'usaepay-payments') . '"></div>'
       . '<div class="usaepay-card-errors" id="' . esc_attr($base) . '-errors" role="alert" aria-live="polite"></div>'
-      . '<input type="hidden" class="usaepay-payment-key" name="input_' . $id . '" id="' . esc_attr($input_id) . '" value="" autocomplete="off">'
+      . '<input type="hidden" class="usaepay-payment-key" name="input_' . $id . '" id="' . esc_attr($input_id) . '" value="' . esc_attr($carry) . '" autocomplete="off">'
       . '<p class="usaepay-card-note">' . $note . '</p>'
       . '</div>';
   }

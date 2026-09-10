@@ -8,7 +8,9 @@ use Give\Subscriptions\Models\SubscriptionNote;
 use Give\Subscriptions\ValueObjects\SubscriptionStatus;
 use Usaepay\AmbiguousGatewayException;
 use Usaepay\GatewayException;
+use Usaepay\ReconciliationInconclusiveException;
 use Usaepay\WordPress\Gateway as Shared;
+use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Log;
 use Usaepay\WordPress\Plugin;
 
@@ -21,6 +23,10 @@ use Usaepay\WordPress\Plugin;
  * and bumps renewsAt. Decline: status Failing, renewsAt pushed RETRY_DAYS
  * ahead, up to MAX_ATTEMPTS, then Cancelled. Attempt counts live in one
  * option keyed by subscription id (GiveWP has no subscription meta table).
+ *
+ * The orderid of every charge is written to that state (with the time) BEFORE
+ * the charge is sent and cleared only once the outcome is recorded, so a run
+ * that finds it looks the charge up before sending another one.
  */
 final class Renewals {
 
@@ -28,7 +34,7 @@ final class Renewals {
 
   public const MAX_ATTEMPTS = 3;
 
-  private const LOCK = 'usaepay_give_renewals_lock';
+  private const LOCK = 'give_renewals';
 
   private const STATE = 'usaepay_give_renewal_state';
 
@@ -38,11 +44,10 @@ final class Renewals {
   public function run(?\DateTimeImmutable $now = NULL): array {
     $now = $now ?? new \DateTimeImmutable('now', wp_timezone());
     $summary = ['due' => 0, 'charged' => 0, 'declined' => 0, 'cancelled' => 0, 'completed' => 0, 'skipped' => 0, 'ambiguous' => 0];
-    if (get_transient(self::LOCK)) {
+    if (!Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS)) {
       $summary['skipped']++;
       return $summary;
     }
-    set_transient(self::LOCK, time(), 15 * MINUTE_IN_SECONDS);
     try {
       foreach ($this->dueSubscriptions($now) as $subscription) {
         $summary['due']++;
@@ -51,7 +56,7 @@ final class Renewals {
       }
     }
     finally {
-      delete_transient(self::LOCK);
+      Lock::release(self::LOCK);
     }
     return $summary;
   }
@@ -90,11 +95,10 @@ final class Renewals {
       SubscriptionNote::create(['subscriptionId' => $id, 'content' => __('All scheduled donations have been made.', 'usaepay-payments')]);
       return 'completed';
     }
-    $lockKey = 'usaepay_give_renewal_' . $id;
-    if (get_transient($lockKey)) {
+    $lockKey = 'give_renewal_' . $id;
+    if (!Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS)) {
       return 'skipped';
     }
-    set_transient($lockKey, time(), 10 * MINUTE_IN_SECONDS);
 
     try {
       $state = $this->state($id);
@@ -127,38 +131,53 @@ final class Renewals {
       unset($metadata['clientip']);
       $amount = $subscription->amount->formatToDecimal();
       $pendingOrderId = (string) ($state['reconcile'] ?? '');
+      $pendingSentAt = (int) ($state['reconcile_sent_at'] ?? 0);
+      $response = NULL;
 
       try {
         $client = Plugin::instance()->gateway()->client(Gateway::INTEGRATION, Gateway::mode());
         if ($pendingOrderId !== '') {
-          // A previous run sent a charge and never read the answer: find out
-          // what happened before sending another one.
-          $found = $this->findApproved($client, $pendingOrderId);
-          unset($state['reconcile']);
-          $this->saveState($id, $state ?: NULL);
-          if ($found) {
-            SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)]);
-            return $this->recordSuccess($subscription, $found, $installment);
-          }
+          // A previous run sent this charge and never recorded the answer.
+          // Find out what happened before sending another one; an unanswered
+          // lookup keeps the marker and ends this run without a charge.
+          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL);
+          SubscriptionNote::create(['subscriptionId' => $id, 'content' => $response
+            ? sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)
+            : sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId)]);
         }
-        $response = $client->saleWithCardReference((string) $subscription->gatewaySubscriptionId, $amount, $metadata);
+        if ($response === NULL) {
+          $this->setMarker($id, $orderId);
+          $response = $client->saleWithCardReference((string) $subscription->gatewaySubscriptionId, $amount, $metadata);
+        }
+      }
+      catch (ReconciliationInconclusiveException $e) {
+        Log::error('GiveWP renewal reconciliation inconclusive', ['subscription' => $id, 'error' => $e->getMessage()]);
+        SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay could not confirm whether the charge %s was processed. No new charge was sent; it will be checked again next hour.', 'usaepay-payments'), $pendingOrderId)]);
+        return 'ambiguous';
       }
       catch (AmbiguousGatewayException $e) {
         Log::error('GiveWP renewal ambiguous', ['subscription' => $id, 'error' => $e->getMessage()]);
-        $found = $this->findApproved($client, $orderId);
+        try {
+          $found = $this->findTransaction($client, $orderId, time());
+        }
+        catch (ReconciliationInconclusiveException $lookup) {
+          $found = NULL;
+        }
         if (!$found) {
-          $state['reconcile'] = $orderId;
-          $this->saveState($id, $state);
+          // The marker stays: the next run reconciles before any retry.
           SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay did not answer when charging the renewal due %1$s (attempt %2$d). It will be checked again next hour before any retry.', 'usaepay-payments'), $installment, $attempt + 1)]);
           return 'ambiguous';
         }
         $response = $found;
       }
       catch (GatewayException $e) {
+        // The gateway answered: nothing was charged.
+        $this->clearMarker($id);
         $response = ['result_code' => 'E', 'error' => $e->getMessage()] + $e->getResponseData();
       }
       catch (\Throwable $e) {
         // Misconfiguration or a coding error must not kill the whole cron run.
+        // A marker already written stays, so the next run looks it up first.
         Log::error('GiveWP renewal skipped', ['subscription' => $id, 'error' => $e->getMessage()]);
         SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay renewal skipped: %s', 'usaepay-payments'), $e->getMessage())]);
         return 'skipped';
@@ -170,7 +189,7 @@ final class Renewals {
       return $this->recordFailure($subscription, $response, $installment, $attempt, $now);
     }
     finally {
-      delete_transient($lockKey);
+      Lock::release($lockKey);
     }
   }
 
@@ -178,7 +197,16 @@ final class Renewals {
     $id = (int) $subscription->id;
     $transaction = Shared::transactionReference($response);
     if ($transaction !== '' && give()->donations->getByGatewayTransactionId($transaction)) {
+      // Recorded by a run that died before it could clean up: finish that.
       Log::debug('GiveWP renewal already recorded', ['subscription' => $id, 'transaction' => $transaction]);
+      if ($subscription->renewsAt instanceof \DateTimeInterface && $subscription->renewsAt <= new \DateTime('now', wp_timezone())) {
+        $subscription->bumpRenewalDate();
+      }
+      if ($subscription->status->isFailing()) {
+        $subscription->status = SubscriptionStatus::ACTIVE();
+      }
+      $subscription->save();
+      $this->saveState($id, NULL);
       return 'skipped';
     }
     // A retry moved renewsAt to the retry date; put the real due date back so
@@ -230,6 +258,7 @@ final class Renewals {
     $subscription->status = SubscriptionStatus::FAILING();
     $subscription->renewsAt = \DateTime::createFromImmutable($retry);
     $subscription->save();
+    // The new state carries no marker: the decline was a conclusive answer.
     $this->saveState($id, ['attempts' => $attempt, 'installment' => $installment, 'renews_at' => $state['renews_at'] ?? NULL]);
     SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('Renewal due %1$s declined (attempt %2$d of %3$d): %4$s. Next attempt %5$s.', 'usaepay-payments'), $installment, $attempt, self::MAX_ATTEMPTS, $failure['gateway'], $retry->format('Y-m-d H:i'))]);
     return 'declined';
@@ -246,18 +275,40 @@ final class Renewals {
   }
 
   /**
-   * The approved transaction carrying this orderid, or NULL when none is
-   * listed or the lookup itself fails.
+   * The listed transaction carrying this orderid (approved or declined), or
+   * NULL when USAePay provably has none.
+   *
+   * @throws \Usaepay\ReconciliationInconclusiveException
+   *   When the answer is unknown: the listing window ran out or the lookup
+   *   itself failed. Callers must not charge.
    */
-  private function findApproved(\Usaepay\GatewayClient $client, string $orderId): ?array {
+  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt): ?array {
     try {
-      $found = $client->findTransactionByOrderId($orderId);
+      return $client->findTransactionByOrderId($orderId, $sentAt);
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      throw $e;
     }
     catch (\Throwable $lookup) {
       Log::error('GiveWP renewal reconciliation failed', ['error' => $lookup->getMessage()]);
-      return NULL;
+      throw new ReconciliationInconclusiveException('The lookup for ' . $orderId . ' failed: ' . $lookup->getMessage(), 0, [], $lookup);
     }
-    return $found && Shared::approved($found) ? $found : NULL;
+  }
+
+  /**
+   * Record that a charge with this orderid is about to be sent.
+   */
+  private function setMarker(int $subscriptionId, string $orderId): void {
+    $state = $this->state($subscriptionId);
+    $state['reconcile'] = $orderId;
+    $state['reconcile_sent_at'] = time();
+    $this->saveState($subscriptionId, $state);
+  }
+
+  private function clearMarker(int $subscriptionId): void {
+    $state = $this->state($subscriptionId);
+    unset($state['reconcile'], $state['reconcile_sent_at']);
+    $this->saveState($subscriptionId, $state ?: NULL);
   }
 
   private function state(int $subscriptionId): array {

@@ -5,7 +5,9 @@ namespace Usaepay\WordPress\Modules\WooCommerce;
 use Usaepay\AmbiguousGatewayException;
 use Usaepay\DonorMessage;
 use Usaepay\GatewayException;
+use Usaepay\ReconciliationInconclusiveException;
 use Usaepay\WordPress\Gateway as Shared;
+use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Plugin;
 
 /**
@@ -139,7 +141,7 @@ final class Gateway extends \WC_Payment_Gateway {
       'configured' => $settings->isConfigured(),
       'sandbox' => $settings->isSandbox(),
       'applePay' => [
-        'enabled' => $settings->applePayEnabled(),
+        'enabled' => $settings->applePayEnabled() && !$this->cardOnFileRequired(),
         'displayName' => $settings->applePayDisplayName(),
         'countryCode' => WC()->countries ? WC()->countries->get_base_country() : 'US',
         'currencyCode' => get_woocommerce_currency(),
@@ -178,7 +180,9 @@ final class Gateway extends \WC_Payment_Gateway {
       $this->saved_payment_methods();
     }
     echo '<div class="wc-payment-form usaepay-wc-fields">';
-    echo '<div class="usaepay-apple-pay" id="usaepay-wc-apple-pay" hidden><div class="usaepay-apple-pay-button" id="usaepay-wc-apple-pay-button"></div><div class="usaepay-apple-pay-divider"><span>' . esc_html__('or enter card details', 'usaepay-payments') . '</span></div></div>';
+    if ($this->settings()->applePayEnabled() && !$this->cardOnFileRequired()) {
+      echo '<div class="usaepay-apple-pay" id="usaepay-wc-apple-pay" hidden><div class="usaepay-apple-pay-button" id="usaepay-wc-apple-pay-button"></div><div class="usaepay-apple-pay-divider"><span>' . esc_html__('or enter card details', 'usaepay-payments') . '</span></div></div>';
+    }
     echo '<div id="usaepay-wc-card" class="usaepay-card-element" aria-label="' . esc_attr__('Secure card details', 'usaepay-payments') . '"></div>';
     echo '<div id="usaepay-wc-errors" class="usaepay-card-errors" role="alert" aria-live="polite"></div>';
     echo '<input type="hidden" id="usaepay_payment_key" name="usaepay_payment_key" value="" autocomplete="off">';
@@ -197,6 +201,28 @@ final class Gateway extends \WC_Payment_Gateway {
    */
   private function cartForcesSavedCard(): bool {
     return class_exists('WC_Subscriptions_Cart') && \WC_Subscriptions_Cart::cart_contains_subscription();
+  }
+
+  /**
+   * Apple Pay keys are single-use and return no saved card, so the button is
+   * offered only where nothing needs to be charged later: not for
+   * subscription carts, saving a card, changing a subscription's card, or
+   * paying an order that contains a subscription.
+   */
+  private function cardOnFileRequired(): bool {
+    if (is_add_payment_method_page() || $this->cartForcesSavedCard()) {
+      return TRUE;
+    }
+    if (!empty($_GET['change_payment_method'])) {
+      return TRUE;
+    }
+    if (is_wc_endpoint_url('order-pay')) {
+      $order = wc_get_order(absint(get_query_var('order-pay')));
+      if ($order && ((function_exists('wcs_is_subscription') && wcs_is_subscription($order)) || $this->orderNeedsCardOnFile($order))) {
+        return TRUE;
+      }
+    }
+    return FALSE;
   }
 
   public function validate_fields() {
@@ -541,6 +567,22 @@ final class Gateway extends \WC_Payment_Gateway {
     if (!$order) {
       return;
     }
+    // Action Scheduler runs one job at a time, but an admin "Retry payment"
+    // can overlap it; only one charge attempt per order at a time.
+    $lock = 'wc_renewal_' . $order->get_id();
+    if (!Lock::acquire($lock, 10 * MINUTE_IN_SECONDS)) {
+      $order->add_order_note(__('USAePay: another renewal attempt for this order is still running; nothing was charged.', 'usaepay-payments'));
+      return;
+    }
+    try {
+      $this->chargeRenewal($order, (float) $amount);
+    }
+    finally {
+      Lock::release($lock);
+    }
+  }
+
+  private function chargeRenewal(\WC_Order $order, float $amount): void {
     $cardReference = trim((string) $order->get_meta(self::META_CARD_REFERENCE));
     if ($cardReference === '' && function_exists('wcs_get_subscriptions_for_renewal_order')) {
       foreach (wcs_get_subscriptions_for_renewal_order($order) as $subscription) {
@@ -559,7 +601,6 @@ final class Gateway extends \WC_Payment_Gateway {
       $order->update_status('failed', sprintf(__('USAePay: subscription card was saved in %1$s mode but the site is in %2$s mode. Skipped.', 'usaepay-payments'), $mode, $this->settings()->mode()));
       return;
     }
-    $amount = (float) $amount;
     if ($amount <= 0) {
       $order->payment_complete();
       return;
@@ -569,9 +610,18 @@ final class Gateway extends \WC_Payment_Gateway {
     }
     // An earlier attempt may have been charged without a readable response
     // (timeout, fatal): look every previous orderid up before charging again.
+    // The attempt counter and first-attempt time are written BEFORE each
+    // charge, so nothing sent can escape this check.
     $attempts = (int) $order->get_meta('_usaepay_renewal_attempts');
+    $firstSentAt = (int) $order->get_meta('_usaepay_renewal_sent_at');
     for ($i = 0; $i < $attempts; $i++) {
-      $found = $this->findApproved('wc-' . $order->get_id() . '-' . $i);
+      try {
+        $found = $this->findApproved('wc-' . $order->get_id() . '-' . $i, $firstSentAt ?: NULL);
+      }
+      catch (ReconciliationInconclusiveException $e) {
+        $order->add_order_note(sprintf(__('USAePay could not confirm whether attempt %d was charged (%s). The order stays pending and nothing new was charged; retry later.', 'usaepay-payments'), $i + 1, $e->getMessage()));
+        return;
+      }
       if ($found) {
         $order->add_order_note(sprintf(__('USAePay: attempt %d had already been charged; recorded without charging again.', 'usaepay-payments'), $i + 1));
         $this->completeRenewal($order, $found);
@@ -582,6 +632,9 @@ final class Gateway extends \WC_Payment_Gateway {
     $metadata = $this->metadata($order, $orderId);
     unset($metadata['clientip']);
     $order->update_meta_data('_usaepay_renewal_attempts', $attempts + 1);
+    if ($firstSentAt <= 0) {
+      $order->update_meta_data('_usaepay_renewal_sent_at', time());
+    }
     $order->save();
 
     $outcome = $this->charge(static fn($client) => $client->saleWithCardReference($cardReference, self::money($amount), $metadata), $orderId, $order);
@@ -609,16 +662,23 @@ final class Gateway extends \WC_Payment_Gateway {
   }
 
   /**
-   * The approved transaction carrying this orderid, or NULL when none is
-   * listed among the newest transactions or the lookup itself fails.
+   * The approved transaction carrying this orderid, or NULL when USAePay
+   * provably has none (or only a declined one).
+   *
+   * @throws \Usaepay\ReconciliationInconclusiveException
+   *   When the answer is unknown: the listing window ran out or the lookup
+   *   itself failed. Callers must not charge.
    */
-  private function findApproved(string $orderId): ?array {
+  private function findApproved(string $orderId, ?int $sentAt): ?array {
     try {
-      $found = $this->shared()->client(self::INTEGRATION)->findTransactionByOrderId($orderId);
+      $found = $this->shared()->client(self::INTEGRATION)->findTransactionByOrderId($orderId, $sentAt);
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      throw $e;
     }
     catch (\Throwable $e) {
       $this->log('Reconciliation lookup failed for ' . $orderId . ': ' . $e->getMessage(), 'error');
-      return NULL;
+      throw new ReconciliationInconclusiveException('The lookup for ' . $orderId . ' failed: ' . $e->getMessage(), 0, [], $e);
     }
     return $found && Shared::approved($found) ? $found : NULL;
   }
@@ -689,7 +749,7 @@ final class Gateway extends \WC_Payment_Gateway {
       $found = NULL;
       if ($orderId !== NULL) {
         try {
-          $found = $client->findTransactionByOrderId($orderId);
+          $found = $client->findTransactionByOrderId($orderId, time());
         }
         catch (\Throwable $lookup) {
           $this->log('Reconciliation failed: ' . $lookup->getMessage(), 'error');
@@ -721,6 +781,13 @@ final class Gateway extends \WC_Payment_Gateway {
         $order->add_order_note(sprintf(__('USAePay declined the card: %s', 'usaepay-payments'), $failure['gateway']));
       }
       return ['error' => $failure['donor'], 'gateway' => $failure['gateway']];
+    }
+    if (!empty($response['void_error'])) {
+      // The card was saved, but the $1 verification hold was not released.
+      $this->log('Verification hold not voided: ' . $response['void_error'], 'error');
+      if ($order) {
+        $order->add_order_note(sprintf(__('USAePay saved the card but did not void the %1$s verification hold (%2$s). The hold expires on its own; void it in the console to release it sooner.', 'usaepay-payments'), wc_price((float) \Usaepay\GatewayClient::CARD_VERIFICATION_AMOUNT), $response['void_error']));
+      }
     }
     return ['response' => $response];
   }

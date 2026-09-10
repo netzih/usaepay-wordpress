@@ -4,7 +4,9 @@ namespace Usaepay\WordPress\Modules\GravityForms;
 
 use Usaepay\AmbiguousGatewayException;
 use Usaepay\GatewayException;
+use Usaepay\ReconciliationInconclusiveException;
 use Usaepay\WordPress\Gateway;
+use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Settings;
 
 /**
@@ -13,12 +15,14 @@ use Usaepay\WordPress\Settings;
  * Runs from GF's hourly {slug}_cron. Each installment has a scheduled date;
  * a decline is retried every Schedule::RETRY_DAYS up to Schedule::MAX_ATTEMPTS
  * times, then the subscription is cancelled. The orderid sent to USAePay is
- * unique per entry/installment/attempt, so an interrupted run can be
- * reconciled instead of double-charging.
+ * unique per entry/installment/attempt and is written to the entry (with the
+ * time) BEFORE the charge is sent; it is cleared only once the outcome has
+ * been recorded. A run that finds the marker looks the orderid up first, so a
+ * crash or lost response anywhere in between never leads to a second charge.
  */
 final class Renewals {
 
-  private const LOCK = 'usaepay_gf_renewals_lock';
+  private const LOCK = 'gf_renewals';
 
   private AddOn $addon;
 
@@ -38,11 +42,10 @@ final class Renewals {
   public function run(?\DateTimeImmutable $now = NULL): array {
     $now = $now ?? new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
     $summary = ['due' => 0, 'charged' => 0, 'declined' => 0, 'cancelled' => 0, 'expired' => 0, 'skipped' => 0, 'ambiguous' => 0];
-    if (get_transient(self::LOCK)) {
+    if (!Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS)) {
       $summary['skipped']++;
       return $summary;
     }
-    set_transient(self::LOCK, time(), 15 * MINUTE_IN_SECONDS);
     try {
       foreach ($this->dueEntries($now) as $entry) {
         $summary['due']++;
@@ -51,7 +54,7 @@ final class Renewals {
       }
     }
     finally {
-      delete_transient(self::LOCK);
+      Lock::release(self::LOCK);
     }
     return $summary;
   }
@@ -111,11 +114,10 @@ final class Renewals {
       $this->addon->log_debug(__METHOD__ . "(): entry #$id was created in $mode mode; current mode is " . $this->settings->mode() . '. Skipped.');
       return 'skipped';
     }
-    $lockKey = 'usaepay_gf_renewal_' . $id;
-    if (get_transient($lockKey)) {
+    $lockKey = 'gf_renewal_' . $id;
+    if (!Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS)) {
       return 'skipped';
     }
-    set_transient($lockKey, time(), 10 * MINUTE_IN_SECONDS);
 
     try {
       $times = (int) $meta('usaepay_recurring_times', 0);
@@ -153,36 +155,56 @@ final class Renewals {
       unset($metadata['clientip']);
       $reference = (string) $meta('usaepay_card_reference');
       $pendingOrderId = (string) $meta('usaepay_reconcile_order_id');
+      $pendingSentAt = (int) $meta('usaepay_reconcile_sent_at', 0);
+      $response = NULL;
 
       try {
         $client = $this->gateway->client(AddOn::INTEGRATION);
         if ($pendingOrderId !== '') {
-          // A previous run sent a charge and never read the answer: find out
-          // what happened before sending another one.
-          $found = $this->findApproved($client, $pendingOrderId);
-          gform_update_meta($id, 'usaepay_reconcile_order_id', '');
-          if ($found) {
-            $this->addon->add_note($id, sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
-            return $this->recordSuccess($entry, $found, $amount, $scheduled, $start ?? $scheduled, $index, $now, $length, $unit, $made, $times);
+          // A previous run sent this charge and never recorded the answer.
+          // Find out what happened before sending another one; an unanswered
+          // lookup keeps the marker and ends this run without a charge.
+          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL);
+          if ($response) {
+            $this->addon->add_note($id, sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
+          }
+          else {
+            $this->addon->add_note($id, sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId));
           }
         }
-        $response = $client->saleWithCardReference($reference, AddOn::money($amount), $metadata);
+        if ($response === NULL) {
+          $this->setMarker($id, $orderId);
+          $response = $client->saleWithCardReference($reference, AddOn::money($amount), $metadata);
+        }
+      }
+      catch (ReconciliationInconclusiveException $e) {
+        $this->addon->log_error(__METHOD__ . "(): entry #$id: " . $e->getMessage());
+        $this->addon->add_note($id, sprintf(__('USAePay could not confirm whether the charge %s was processed. No new charge was sent; it will be checked again next hour.', 'usaepay-payments'), $pendingOrderId), 'error');
+        return 'ambiguous';
       }
       catch (AmbiguousGatewayException $e) {
         $this->addon->log_error(__METHOD__ . "(): entry #$id ambiguous: " . $e->getMessage());
-        $found = $this->findApproved($client, $orderId);
+        try {
+          $found = $this->findTransaction($client, $orderId, time());
+        }
+        catch (ReconciliationInconclusiveException $lookup) {
+          $found = NULL;
+        }
         if (!$found) {
-          gform_update_meta($id, 'usaepay_reconcile_order_id', $orderId);
+          // The marker stays: the next run reconciles before any retry.
           $this->addon->add_note($id, sprintf(__('USAePay did not answer when charging installment %1$s (attempt %2$d). It will be checked again next hour before any retry.', 'usaepay-payments'), $scheduled->format('Y-m-d'), $attempt + 1), 'error');
           return 'ambiguous';
         }
         $response = $found;
       }
       catch (GatewayException $e) {
+        // The gateway answered: nothing was charged.
+        $this->clearMarker($id);
         $response = ['result_code' => 'E', 'error' => $e->getMessage()] + $e->getResponseData();
       }
       catch (\Throwable $e) {
         // Misconfiguration or a coding error must not kill the whole cron run.
+        // A marker already written stays, so the next run looks it up first.
         $this->addon->log_error(__METHOD__ . "(): entry #$id: " . $e->getMessage());
         $this->addon->add_note($id, sprintf(__('USAePay renewal skipped: %s', 'usaepay-payments'), $e->getMessage()), 'error');
         return 'skipped';
@@ -194,23 +216,42 @@ final class Renewals {
       return $this->recordFailure($entry, $response, $amount, $scheduled, $now, $attempt);
     }
     finally {
-      delete_transient($lockKey);
+      Lock::release($lockKey);
     }
   }
 
   /**
-   * The approved transaction carrying this orderid, or NULL when none is
-   * listed or the lookup itself fails.
+   * The listed transaction carrying this orderid (approved or declined), or
+   * NULL when USAePay provably has none.
+   *
+   * @throws \Usaepay\ReconciliationInconclusiveException
+   *   When the answer is unknown: the listing window ran out or the lookup
+   *   itself failed. Callers must not charge.
    */
-  private function findApproved(\Usaepay\GatewayClient $client, string $orderId): ?array {
+  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt): ?array {
     try {
-      $found = $client->findTransactionByOrderId($orderId);
+      return $client->findTransactionByOrderId($orderId, $sentAt);
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      throw $e;
     }
     catch (\Throwable $lookup) {
       $this->addon->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
-      return NULL;
+      throw new ReconciliationInconclusiveException('The lookup for ' . $orderId . ' failed: ' . $lookup->getMessage(), 0, [], $lookup);
     }
-    return $found && Gateway::approved($found) ? $found : NULL;
+  }
+
+  /**
+   * Record that a charge with this orderid is about to be sent.
+   */
+  private function setMarker(int $entryId, string $orderId): void {
+    gform_update_meta($entryId, 'usaepay_reconcile_order_id', $orderId);
+    gform_update_meta($entryId, 'usaepay_reconcile_sent_at', time());
+  }
+
+  private function clearMarker(int $entryId): void {
+    gform_update_meta($entryId, 'usaepay_reconcile_order_id', '');
+    gform_update_meta($entryId, 'usaepay_reconcile_sent_at', 0);
   }
 
   private function recordSuccess(array $entry, array $response, float $amount, \DateTimeImmutable $scheduled, \DateTimeImmutable $start, int $index, \DateTimeImmutable $now, int $length, string $unit, int $made, int $times): string {
@@ -227,6 +268,7 @@ final class Renewals {
     gform_update_meta($id, 'usaepay_payments_made', $made);
     gform_update_meta($id, 'usaepay_failed_attempts', 0);
     gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
+    $this->clearMarker($id);
 
     if ($times > 0 && $made >= $times) {
       $entry['payment_status'] = 'Active';
@@ -247,6 +289,7 @@ final class Renewals {
     $failure = Gateway::failure($response);
     $attempt++;
     gform_update_meta($id, 'usaepay_failed_attempts', $attempt);
+    $this->clearMarker($id);
     $this->addon->log_error(__METHOD__ . "(): entry #$id declined (attempt $attempt): " . $failure['gateway']);
 
     if ($attempt >= Schedule::MAX_ATTEMPTS) {

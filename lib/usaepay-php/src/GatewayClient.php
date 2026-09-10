@@ -177,22 +177,41 @@ class GatewayClient {
   }
 
   /**
+   * USAePay stamps 'created' in the merchant account's time zone without an
+   * offset. Reading it as UTC can be off by up to 14 hours either way, so a
+   * time cutoff is widened by this much before it is trusted.
+   */
+  public const CREATED_TIME_SLACK = 26 * 3600;
+
+  /**
    * Find a recent transaction by the orderid we sent with it.
    *
    * The transactions list endpoint ignores filter parameters (verified against
    * the sandbox), so this pages through the newest transactions and matches
    * orderid locally. Used to reconcile a charge whose response never arrived.
    *
+   * @param int|null $sentAt
+   *   Unix time the charge was sent. Paging stops at the first row created
+   *   before it (minus CREATED_TIME_SLACK): a miss is then conclusive.
+   * @param int $maxPages
+   *   Pages of 100 rows to read before giving up.
+   *
    * @return array|null
    *   The transaction row (with 'key', 'result_code', 'trantype_code',
-   *   'status_code', 'amount', 'creditcard'), or NULL when none of the newest
-   *   $maxPages * 100 transactions carry that orderid.
+   *   'status_code', 'amount', 'creditcard'), or NULL when the orderid is
+   *   provably absent: the listing ran out, or every row newer than the cutoff
+   *   was checked.
+   *
+   * @throws ReconciliationInconclusiveException
+   *   When $maxPages were read without finding the orderid or reaching the
+   *   cutoff (or, with no cutoff, the end of the listing).
    */
-  public function findTransactionByOrderId(string $orderId, int $maxPages = 3): ?array {
+  public function findTransactionByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5): ?array {
     $orderId = trim($orderId);
     if ($orderId === '') {
       throw new \InvalidArgumentException('An orderid is required.');
     }
+    $cutoff = $sentAt !== NULL ? $sentAt - self::CREATED_TIME_SLACK : NULL;
     $pageSize = 100;
     for ($page = 0; $page < max(1, $maxPages); $page++) {
       $rows = $this->listTransactions($pageSize, $page * $pageSize);
@@ -200,12 +219,38 @@ class GatewayClient {
         if (is_array($row) && (string) ($row['orderid'] ?? '') === $orderId) {
           return $row;
         }
+        if ($cutoff !== NULL) {
+          $created = self::createdTime($row);
+          if ($created !== NULL && $created < $cutoff) {
+            return NULL;
+          }
+        }
       }
       if (count($rows) < $pageSize) {
-        break;
+        return NULL;
       }
     }
-    return NULL;
+    throw new ReconciliationInconclusiveException(sprintf(
+      'The newest %d USAePay transactions do not carry orderid %s, and older ones were not checked.',
+      max(1, $maxPages) * $pageSize,
+      $orderId
+    ));
+  }
+
+  /**
+   * A listed row's 'created' stamp read as UTC (see CREATED_TIME_SLACK).
+   */
+  private static function createdTime(array $row): ?int {
+    $created = trim((string) ($row['created'] ?? ''));
+    if ($created === '') {
+      return NULL;
+    }
+    try {
+      return (new \DateTimeImmutable($created, new \DateTimeZone('UTC')))->getTimestamp();
+    }
+    catch (\Throwable $e) {
+      return NULL;
+    }
   }
 
   /**
@@ -325,7 +370,9 @@ class GatewayClient {
     $decoded = json_decode($responseBody, TRUE);
     $data = is_array($decoded) ? $decoded : [];
 
-    if ($status >= 500 || $status === 0) {
+    // 5xx, no status (transport failure) and 408 (the gateway may have
+    // processed the request but timed out sending the answer) are ambiguous.
+    if ($status >= 500 || $status === 0 || $status === 408) {
       throw new AmbiguousGatewayException(
         'USAePay did not return a conclusive response. Reconcile the transaction before retrying.',
         $status,

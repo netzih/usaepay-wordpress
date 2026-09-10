@@ -227,6 +227,49 @@ final class GatewayClientTest extends TestCase {
     self::assertSame(1, $calls);
   }
 
+  public function testFindTransactionByOrderIdStopsAtRowsOlderThanTheCharge(): void {
+    $calls = 0;
+    $sentAt = strtotime('2026-09-09 12:00:00 UTC');
+    // Newest first: a row from two days before the charge ends the search.
+    $rows = [
+      ['key' => 'k1', 'orderid' => 'other-1', 'created' => '2026-09-09 12:05:00'],
+      ['key' => 'k2', 'orderid' => 'other-2', 'created' => '2026-09-07 09:00:00'],
+      ['key' => 'k3', 'orderid' => 'usaepayjs-7-2026-09-09-0', 'created' => '2026-09-01 09:00:00'],
+    ];
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function () use (&$calls, $rows): array {
+      $calls++;
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => array_pad($rows, 100, ['key' => 'pad', 'orderid' => 'pad', 'created' => '2026-01-01 00:00:00'])])];
+    });
+
+    self::assertNull($client->findTransactionByOrderId('usaepayjs-7-2026-09-09-0', $sentAt));
+    self::assertSame(1, $calls);
+  }
+
+  public function testFindTransactionByOrderIdIsInconclusiveWhenPagesRunOut(): void {
+    $calls = 0;
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function () use (&$calls): array {
+      $calls++;
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => array_fill(0, 100, ['key' => 'k', 'orderid' => 'nope', 'created' => '2026-09-09 12:00:00'])])];
+    });
+
+    try {
+      $client->findTransactionByOrderId('usaepayjs-7-2026-09-09-0', strtotime('2026-09-09 11:00:00 UTC'), 2);
+      self::fail('Expected the lookup to be inconclusive.');
+    }
+    catch (\Usaepay\ReconciliationInconclusiveException $e) {
+      self::assertSame(2, $calls);
+      self::assertStringContainsString('200', $e->getMessage());
+    }
+  }
+
+  public function testRequestTimeoutIsAmbiguous(): void {
+    $request = [];
+    $client = $this->client($request, 408, ['error' => 'Request Timeout']);
+
+    $this->expectException(AmbiguousGatewayException::class);
+    $client->void('bnfb4dbycv5pfrd');
+  }
+
   public function testEmptyTransactionReferenceIsRejected(): void {
     $request = [];
     $client = $this->client($request, 200, ['result_code' => 'A']);

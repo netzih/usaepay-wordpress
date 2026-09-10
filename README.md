@@ -17,7 +17,9 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 3. **Settings > USAePay**: choose Sandbox or Live, enter the API key (source
    key), its PIN and the Pay.js public key for that mode, save, then press
    **Check credentials**. The check lists one transaction and mints an unused
-   payment key; nothing is charged.
+   payment key; nothing is charged. Server-side work (charges, refunds,
+   renewals) needs only the key and PIN; checkouts also need the public key
+   and are offered only when all three are present.
 4. On the live source key allow **Sale, Auth Only, Void and Credit (refund)**.
    Auth Only + Void are used to verify a card for a free trial; Credit for refunds.
 
@@ -37,6 +39,13 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
   declined installment is retried every 3 days, three attempts in all, then
   the subscription is cancelled with a note. "Recurring Times" expires the
   entry after that many payments (status **Expired**).
+- Renewals cannot double-charge: the `orderid` of each attempt is written to
+  the entry before the charge is sent and cleared once the outcome is
+  recorded. A run that finds one looks it up at USAePay first (bounded by the
+  time it was sent, so a miss is conclusive) and records the earlier charge
+  instead of sending another. When USAePay cannot be asked, nothing is charged
+  and the entry is checked again next hour. Workers take a database lock, so
+  two cron runs never charge the same entry.
 - **Cancel Subscription** (entry detail) stops further charges; the card
   reference stays on the entry for reference.
 - **Refund via USAePay** (entry detail, one-time payments): unsettled sales
@@ -97,7 +106,13 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
   `woocommerce_scheduled_subscription_payment_usaepay` against the card
   reference copied onto the subscription; card changes by customer or admin go
   through the same checkout fields and verify the card with a $1 authorization
-  that is voided at once. Free trials verify the card the same way.
+  that is voided at once. Free trials verify the card the same way. Renewal
+  orders count attempts before each charge and reconcile earlier attempts by
+  `orderid` first; an order is left pending, not re-charged, while USAePay
+  cannot confirm what happened.
+- Apple Pay is offered on plain carts only: keys are single-use and return no
+  saved card, so the button is hidden for subscription carts, Pay for Order on
+  subscription orders, payment-method changes and Add Payment Method.
 
 ### Conventions shared with the CiviCRM import
 
@@ -113,7 +128,8 @@ AVS. No top-level `email` is sent, so USAePay does not email its own receipt.
 also `usaepay_card_reference`, `usaepay_interval_length/unit`,
 `usaepay_recurring_times`, `usaepay_payments_made`, `usaepay_failed_attempts`,
 `usaepay_schedule_start`, `usaepay_installment_index`, `usaepay_scheduled_date`,
-`usaepay_next_charge`, `usaepay_last_transaction_key`. A subscription created in
+`usaepay_next_charge`, `usaepay_last_transaction_key`, and while a charge is in
+flight `usaepay_reconcile_order_id` / `usaepay_reconcile_sent_at`. A subscription created in
 sandbox mode is skipped by the renewal worker while the plugin is in live mode
 (and vice versa).
 

@@ -67,8 +67,20 @@ final class Settings {
     return trim((string) $this->get(($mode ?? $this->mode()) . '_public_key'));
   }
 
+  /**
+   * The API key and PIN are present: server-side calls (charges, refunds,
+   * renewals) can be made.
+   */
+  public function hasApiCredentials(?string $mode = NULL): bool {
+    return $this->apiKey($mode) !== '' && $this->apiPin($mode) !== '';
+  }
+
+  /**
+   * Everything a checkout needs: API credentials plus the Pay.js public key
+   * the browser uses to tokenize cards.
+   */
   public function isConfigured(?string $mode = NULL): bool {
-    return $this->apiKey($mode) !== '' && $this->apiPin($mode) !== '' && $this->publicKey($mode) !== '';
+    return $this->hasApiCredentials($mode) && $this->publicKey($mode) !== '';
   }
 
   public function apiUrl(?string $mode = NULL): string {

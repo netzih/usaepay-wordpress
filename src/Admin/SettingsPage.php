@@ -155,9 +155,9 @@ final class SettingsPage {
     $messages = [];
     $ok = TRUE;
 
-    if (!$this->settings->isConfigured($mode)) {
+    if (!$this->settings->hasApiCredentials($mode)) {
       $ok = FALSE;
-      $messages[] = sprintf(__('%s credentials are incomplete: API key, PIN and Pay.js public key are all required.', 'usaepay-payments'), $label);
+      $messages[] = sprintf(__('%s credentials are incomplete: the API key and PIN are both required.', 'usaepay-payments'), $label);
     }
     else {
       $client = $this->gateway->client('settings check', $mode);
@@ -173,6 +173,9 @@ final class SettingsPage {
         $messages[] = sprintf(__('%1$s API key or PIN rejected: %2$s', 'usaepay-payments'), $label, $e->getMessage());
       }
       try {
+        if ($this->settings->publicKey($mode) === '') {
+          throw new GatewayException(__('none entered; the checkout card fields need it.', 'usaepay-payments'));
+        }
         $client->verifyPublicKey($this->settings->publicKey($mode));
         $messages[] = sprintf(__('%s Pay.js public key accepted.', 'usaepay-payments'), $label);
       }

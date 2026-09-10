@@ -29,8 +29,8 @@ final class Gateway {
    */
   public function client(string $integration, ?string $mode = NULL): GatewayClient {
     $mode = $mode ?? $this->settings->mode();
-    if (!$this->settings->isConfigured($mode)) {
-      throw new GatewayException(__('USAePay is not configured. Enter the API key, PIN and Pay.js public key under Settings > USAePay.', 'usaepay-payments'));
+    if (!$this->settings->hasApiCredentials($mode)) {
+      throw new GatewayException(__('USAePay is not configured. Enter the API key and PIN under Settings > USAePay.', 'usaepay-payments'));
     }
     return new GatewayClient(
       $this->settings->apiKey($mode),

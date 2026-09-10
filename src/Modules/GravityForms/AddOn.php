@@ -580,7 +580,7 @@ final class AddOn extends \GFPaymentAddOn {
       $found = NULL;
       if ($orderId !== NULL) {
         try {
-          $found = $client->findTransactionByOrderId($orderId);
+          $found = $client->findTransactionByOrderId($orderId, time());
         }
         catch (\Throwable $lookup) {
           $this->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
@@ -606,6 +606,11 @@ final class AddOn extends \GFPaymentAddOn {
       $failure = Gateway::failure($response);
       $this->log_error(__METHOD__ . '(): declined: ' . $failure['gateway']);
       return ['error' => $failure['donor']];
+    }
+    if (!empty($response['void_error'])) {
+      // The card was saved, but the $1 verification hold was not released;
+      // it expires on its own. Logged so the console can be checked.
+      $this->log_error(__METHOD__ . '(): card saved but the verification hold was not voided: ' . $response['void_error']);
     }
     return ['response' => $response];
   }
