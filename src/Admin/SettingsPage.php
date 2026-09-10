@@ -29,6 +29,8 @@ final class SettingsPage {
     add_action('admin_menu', [$this, 'addMenu']);
     add_action('admin_init', [$this, 'registerSetting']);
     add_action('admin_post_usaepay_check_credentials', [$this, 'checkCredentials']);
+    add_action('admin_post_usaepay_check_marker', [$this, 'checkMarker']);
+    add_action('admin_post_usaepay_run_renewals', [$this, 'runRenewals']);
     add_action('admin_notices', [$this, 'showNotice']);
     add_filter('plugin_action_links_' . plugin_basename(\Usaepay\WordPress\Plugin::instance()->file()), [$this, 'actionLinks']);
   }
@@ -137,8 +139,117 @@ final class SettingsPage {
           <span class="description" style="margin-left:8px"><?php esc_html_e('Save first. The check lists one transaction and mints an unused payment key; nothing is charged.', 'usaepay-payments'); ?></span>
         </p>
       </form>
+      <?php $this->renderUnresolved(); ?>
     </div>
     <?php
+  }
+
+  /**
+   * Charges and refunds whose answer was never recorded, with a check action.
+   */
+  private function renderUnresolved(): void {
+    $items = (new Unresolved($this->gateway, $this->settings))->items();
+    $runUrl = wp_nonce_url(admin_url('admin-post.php?action=usaepay_run_renewals'), 'usaepay_run_renewals');
+    ?>
+    <h2><?php esc_html_e('Unresolved requests', 'usaepay-payments'); ?></h2>
+    <p><?php esc_html_e('A charge or refund is listed here when it was sent to USAePay and its answer was never recorded: the connection dropped, the page was closed, or the site crashed in between. Nothing here is charged or refunded again until USAePay has confirmed what happened to the earlier request; "Check" asks now.', 'usaepay-payments'); ?></p>
+    <?php if (!$items) : ?>
+      <p><em><?php esc_html_e('None. Every request has a recorded answer.', 'usaepay-payments'); ?></em></p>
+    <?php else : ?>
+      <table class="widefat striped" style="max-width: 1100px">
+        <thead>
+          <tr>
+            <th><?php esc_html_e('Record', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('Request', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('orderid at USAePay', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('Sent', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('Amount', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('Mode', 'usaepay-payments'); ?></th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($items as $item) : ?>
+            <?php $checkUrl = wp_nonce_url(admin_url('admin-post.php?action=usaepay_check_marker&item=' . rawurlencode($item['key'])), 'usaepay_check_marker_' . $item['key']); ?>
+            <tr>
+              <td><a href="<?php echo esc_url($item['url']); ?>"><?php echo esc_html($item['module'] . ': ' . $item['record']); ?></a></td>
+              <td><?php echo esc_html($item['kind'] === 'refund' ? __('Refund', 'usaepay-payments') : __('Charge', 'usaepay-payments')); ?></td>
+              <td><code><?php echo esc_html($item['orderid']); ?></code></td>
+              <td><?php echo $item['sent_at'] > 0 ? esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), $item['sent_at'])) : '&mdash;'; ?></td>
+              <td><?php echo $item['amount'] !== NULL ? esc_html($item['amount']) : '&mdash;'; ?></td>
+              <td><?php echo esc_html($item['mode']); ?></td>
+              <td><a class="button button-small" href="<?php echo esc_url($checkUrl); ?>"><?php esc_html_e('Check at USAePay', 'usaepay-payments'); ?></a></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+    <p>
+      <a class="button" href="<?php echo esc_url($runUrl); ?>"><?php esc_html_e('Run renewal workers now', 'usaepay-payments'); ?></a>
+      <span class="description"><?php esc_html_e('Charges every due Gravity Forms and GiveWP subscription and records any renewal listed above whose charge went through. WooCommerce Subscriptions renewals run on their own scheduler.', 'usaepay-payments'); ?></span>
+    </p>
+    <?php
+  }
+
+  /**
+   * Ask USAePay about one unresolved request and report in a notice.
+   */
+  public function checkMarker(): void {
+    if (!current_user_can('manage_options')) {
+      wp_die(esc_html__('You do not have permission to do that.', 'usaepay-payments'));
+    }
+    $key = isset($_GET['item']) ? sanitize_text_field(wp_unslash((string) $_GET['item'])) : '';
+    check_admin_referer('usaepay_check_marker_' . $key);
+    $unresolved = new Unresolved($this->gateway, $this->settings);
+    $item = $unresolved->find($key);
+    if ($item === NULL) {
+      $result = ['ok' => TRUE, 'message' => __('That request has been resolved in the meantime and is no longer listed.', 'usaepay-payments')];
+    }
+    else {
+      $result = $unresolved->check($item);
+    }
+    set_transient(self::NOTICE_TRANSIENT . '_' . get_current_user_id(), ['ok' => $result['ok'], 'messages' => [$result['message']]], 120);
+    wp_safe_redirect(admin_url('options-general.php?page=' . self::PAGE));
+    exit;
+  }
+
+  /**
+   * Run the Gravity Forms and GiveWP renewal workers now.
+   */
+  public function runRenewals(): void {
+    if (!current_user_can('manage_options')) {
+      wp_die(esc_html__('You do not have permission to do that.', 'usaepay-payments'));
+    }
+    check_admin_referer('usaepay_run_renewals');
+    $messages = [];
+    $plugin = \Usaepay\WordPress\Plugin::instance();
+    if (class_exists('GFAPI') && class_exists(\Usaepay\WordPress\Modules\GravityForms\AddOn::class)) {
+      $summary = (new \Usaepay\WordPress\Modules\GravityForms\Renewals(\Usaepay\WordPress\Modules\GravityForms\AddOn::get_instance(), $this->gateway, $this->settings))->run();
+      $messages[] = __('Gravity Forms:', 'usaepay-payments') . ' ' . self::summaryText($summary);
+    }
+    if (function_exists('give')) {
+      $summary = (new \Usaepay\WordPress\Modules\GiveWP\Renewals())->run();
+      $messages[] = __('GiveWP:', 'usaepay-payments') . ' ' . self::summaryText($summary);
+    }
+    if (!$messages) {
+      $messages[] = __('Neither Gravity Forms nor GiveWP is active.', 'usaepay-payments');
+    }
+    set_transient(self::NOTICE_TRANSIENT . '_' . get_current_user_id(), ['ok' => TRUE, 'messages' => $messages], 120);
+    wp_safe_redirect(admin_url('options-general.php?page=' . self::PAGE));
+    exit;
+  }
+
+  /**
+   * @param array<string, int> $summary
+   */
+  private static function summaryText(array $summary): string {
+    $parts = [];
+    foreach ($summary as $name => $count) {
+      if ($count > 0 || $name === 'due') {
+        $parts[] = $name . ' ' . (int) $count;
+      }
+    }
+    return $parts ? implode(', ', $parts) : __('nothing due', 'usaepay-payments');
   }
 
   /**

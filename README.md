@@ -170,6 +170,14 @@ charging the period again (a donation created after the current renewal date is
 this period's; one created before it belongs to an earlier period, so the
 marker is a leftover and the period is charged).
 
+Settings > USAePay lists every request in that state ("Unresolved requests":
+WooCommerce orders and renewal orders, Gravity Forms entries and submissions
+without an entry, GiveWP donations and subscriptions) with a "Check at USAePay"
+action that reports whether the request went through, was declined or never
+arrived, and what to do next; "Run renewal workers now" runs the Gravity Forms
+and GiveWP renewal workers immediately. The list is read-only: each module
+resolves its own marker on its next attempt.
+
 A signup whose answer was lost is recovered from the listing without the
 saved-card key (USAePay's listing and transaction detail carry no
 `savedcard`, verified against the sandbox), so a subscription signup recovered
