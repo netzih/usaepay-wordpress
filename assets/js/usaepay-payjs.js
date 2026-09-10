@@ -42,18 +42,29 @@
     return String(message);
   }
 
+  /**
+   * Pay.js forwards the card iframe's payload as a JSON string. A field that
+   * turns valid arrives as an "error" with code "0" and an empty message
+   * (reason "clear error"), so an empty message must stay empty: falling back
+   * to the raw JSON let its type ("cvv") match the wording rules above and
+   * showed a security-code warning once the CVV was correct.
+   */
   function errorText(error) {
     if (!error) {
       return '';
     }
-    var message = error.message || error;
-    try {
-      var decoded = typeof error === 'string' ? JSON.parse(error) : error;
-      message = decoded.message || message;
-    } catch (ignored) {
-      // plain string
+    if (typeof error === 'string') {
+      try {
+        var decoded = JSON.parse(error);
+        if (decoded && typeof decoded === 'object') {
+          return typeof decoded.message === 'string' ? decoded.message : '';
+        }
+      } catch (ignored) {
+        // Pay.js v1 emits a plain string.
+      }
+      return error;
     }
-    return String(message);
+    return typeof error.message === 'string' ? error.message : String(error);
   }
 
   /**
