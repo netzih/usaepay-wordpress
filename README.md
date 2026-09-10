@@ -60,7 +60,11 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 - Apple Pay: enable it in Settings > USAePay; the button appears on forms
   whose active USAePay feeds are all one-time, in browsers that support it,
   once the domain is registered with USAePay and Apple's association file is
-  served from `/.well-known/`.
+  served from `/.well-known/`. The amount shown on the sheet is the form total
+  as Gravity Forms 3 computes it (`gform.products.getPaymentAmount()`, current
+  on every keystroke); on GF 2.9 the Total field is read, or the product
+  fields are added up when there is none. Pay.js gives its Apple Pay button
+  one fixed element id, so one form per page can offer Apple Pay.
 
 ## GiveWP
 
