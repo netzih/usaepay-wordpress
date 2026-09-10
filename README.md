@@ -206,3 +206,18 @@ composer run build          # vendor/ with the library copied, no dev deps
 
 Browser tests live outside the repo (`~/.config/usaepayjs/browser/wp-*.mjs`,
 Playwright) and run against the local site described in the project notes.
+
+## To do
+
+- Consolidate the charge/exception ladder. The sequence "get a client, run
+  the request, catch inconclusive / ambiguous / gateway error / invalid
+  argument / busy / not sent, each with its own message and log line" is
+  repeated in the Gravity Forms add-on, the GiveWP gateway, the WooCommerce
+  gateway and both renewal workers. Move it into one shared method that takes
+  the gateway call plus log and note callbacks and returns a typed outcome;
+  each module maps the outcome to its own return shape. Pure movement, own
+  commit, no behaviour change. Deferred on 2026-09-10.
+- Zero- and three-decimal currencies. Amounts are always sent with two
+  decimals, which is right for USD and wrong for JPY, KRW or KWD. Left as a
+  documented USD-only limit by decision on 2026-09-10.
+- Apple Pay in the WooCommerce checkout has not been exercised in a browser.
