@@ -2,6 +2,7 @@
 
 namespace Usaepay\WordPress\Modules\GiveWP;
 
+use Give\Donations\Models\Donation;
 use Give\Donations\Models\DonationNote;
 use Give\Subscriptions\Models\Subscription;
 use Give\Subscriptions\Models\SubscriptionNote;
@@ -103,38 +104,14 @@ final class Renewals {
     }
 
     try {
-      $state = $this->state($id);
-      $attempt = (int) ($state['attempts'] ?? 0);
-      $scheduled = $subscription->renewsAt instanceof \DateTimeInterface ? $subscription->renewsAt->format('Y-m-d') : $now->format('Y-m-d');
-      $installment = (string) ($state['installment'] ?? $scheduled);
-      $orderId = Shared::orderId(sprintf('give-sub-%d-%s-%d', $id, $installment, $attempt));
-      $initial = $subscription->initialDonation();
-      $invoice = 'GIVE-S' . $id;
-      $payer = $initial ? [
-        'email' => (string) $initial->email,
-        'first_name' => (string) $initial->firstName,
-        'last_name' => (string) $initial->lastName,
-        'phone' => (string) $initial->phone,
-        'address' => (string) ($initial->billingAddress->address1 ?? ''),
-        'address2' => (string) ($initial->billingAddress->address2 ?? ''),
-        'city' => (string) ($initial->billingAddress->city ?? ''),
-        'state' => (string) ($initial->billingAddress->state ?? ''),
-        'postcode' => (string) ($initial->billingAddress->zip ?? ''),
-        'country' => (string) ($initial->billingAddress->country ?? ''),
-      ] : [];
-      $currency = 'USD';
-      try {
-        $currency = (string) $subscription->amount->getCurrency()->getCode();
-      }
-      catch (\Throwable $e) {
-        // keep USD
-      }
-      $metadata = Plugin::instance()->gateway()->metadata($invoice, (string) ($initial ? $initial->formTitle : __('Recurring donation', 'usaepay-payments')), $payer, ['currency' => $currency, 'orderid' => $orderId]);
-      unset($metadata['clientip']);
       $amount = $subscription->amount->formatToDecimal();
+      $state = $this->state($id);
       $pendingOrderId = (string) ($state['reconcile'] ?? '');
       $pendingSentAt = (int) ($state['reconcile_sent_at'] ?? 0);
       $response = NULL;
+      $orderId = '';
+      $attempt = 0;
+      $installment = $now->format('Y-m-d');
 
       try {
         $client = Plugin::instance()->gateway()->client(Gateway::INTEGRATION, Gateway::mode());
@@ -144,19 +121,60 @@ final class Renewals {
           // lookup keeps the marker and ends this run without a charge.
           $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL, $amount);
           $earlierKey = $response ? Shared::transactionReference($response) : '';
-          if ($response && $earlierKey !== '' && give()->donations->getByGatewayTransactionId($earlierKey)) {
-            // Recorded in full by a run that died just before clearing the
-            // marker; this run is for the next installment.
-            $this->clearMarker($id);
+          $recorded = $earlierKey !== '' ? give()->donations->getByGatewayTransactionId($earlierKey) : NULL;
+          if ($recorded) {
+            $outcome = $this->finishRecorded($subscription, $recorded, $pendingOrderId);
+            if ($outcome !== NULL) {
+              return $outcome;
+            }
+            // The donation belongs to an earlier period and the state with
+            // it is a leftover: start this period afresh.
+            $this->saveState($id, NULL);
+            $state = [];
             $response = NULL;
           }
           else {
-            SubscriptionNote::create(['subscriptionId' => $id, 'content' => $response
-              ? sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)
-              : sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId)]);
+            if ($response === NULL) {
+              $note = sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId);
+            }
+            elseif (Shared::approved($response)) {
+              $note = sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId);
+            }
+            else {
+              $note = sprintf(__('USAePay shows the earlier charge %s was declined; recorded without charging again.', 'usaepay-payments'), $pendingOrderId);
+            }
+            SubscriptionNote::create(['subscriptionId' => $id, 'content' => $note]);
           }
         }
+
+        $attempt = (int) ($state['attempts'] ?? 0);
+        $scheduled = $subscription->renewsAt instanceof \DateTimeInterface ? $subscription->renewsAt->format('Y-m-d') : $now->format('Y-m-d');
+        $installment = (string) ($state['installment'] ?? $scheduled);
+        $orderId = Shared::orderId(sprintf('give-sub-%d-%s-%d', $id, $installment, $attempt));
+
         if ($response === NULL) {
+          $initial = $subscription->initialDonation();
+          $payer = $initial ? [
+            'email' => (string) $initial->email,
+            'first_name' => (string) $initial->firstName,
+            'last_name' => (string) $initial->lastName,
+            'phone' => (string) $initial->phone,
+            'address' => (string) ($initial->billingAddress->address1 ?? ''),
+            'address2' => (string) ($initial->billingAddress->address2 ?? ''),
+            'city' => (string) ($initial->billingAddress->city ?? ''),
+            'state' => (string) ($initial->billingAddress->state ?? ''),
+            'postcode' => (string) ($initial->billingAddress->zip ?? ''),
+            'country' => (string) ($initial->billingAddress->country ?? ''),
+          ] : [];
+          $currency = 'USD';
+          try {
+            $currency = (string) $subscription->amount->getCurrency()->getCode();
+          }
+          catch (\Throwable $e) {
+            // keep USD
+          }
+          $metadata = Plugin::instance()->gateway()->metadata('GIVE-S' . $id, (string) ($initial ? $initial->formTitle : __('Recurring donation', 'usaepay-payments')), $payer, ['currency' => $currency, 'orderid' => $orderId]);
+          unset($metadata['clientip']);
           $this->setMarker($id, $orderId);
           $response = $client->saleWithCardReference((string) $subscription->gatewaySubscriptionId, $amount, $metadata);
         }
@@ -204,13 +222,60 @@ final class Renewals {
     }
   }
 
+  /**
+   * A renewal donation for the earlier charge already exists.
+   *
+   * GiveWP records a renewal in two steps, the donation and then the next
+   * renewal date. When a run died between them the subscription still shows
+   * this period as due and the donation, created after the due date, is the
+   * one for it: only the date is moved now. A donation created before the
+   * current renewal date belongs to an earlier period, so the marker is a
+   * leftover of a run that died after finishing; NULL then says this period
+   * is still to be charged.
+   *
+   * @return string|null
+   *   charged | completed, or NULL when the donation is an earlier period's.
+   */
+  private function finishRecorded(Subscription $subscription, Donation $donation, string $pendingOrderId): ?string {
+    $id = (int) $subscription->id;
+    $due = $subscription->renewsAt;
+    $created = $donation->createdAt;
+    if (!($due instanceof \DateTimeInterface) || !($created instanceof \DateTimeInterface) || $created < $due) {
+      return NULL;
+    }
+    $state = $this->state($id);
+    if (!empty($state['renews_at'])) {
+      // A retry moved renewsAt to the retry date; advance from the real one.
+      $subscription->renewsAt = new \DateTime((string) $state['renews_at'], wp_timezone());
+    }
+    $subscription->bumpRenewalDate();
+    if ($subscription->status->isFailing()) {
+      $subscription->status = SubscriptionStatus::ACTIVE();
+    }
+    $subscription->save();
+    $this->saveState($id, NULL);
+    SubscriptionNote::create(['subscriptionId' => $id, 'content' => sprintf(__('USAePay confirms the earlier charge %1$s was processed and donation #%2$d had already been recorded for it; the next renewal date is now set.', 'usaepay-payments'), $pendingOrderId, (int) $donation->id)]);
+    if ($this->installmentsDone($subscription)) {
+      $subscription->status = SubscriptionStatus::COMPLETED();
+      $subscription->save();
+      SubscriptionNote::create(['subscriptionId' => $id, 'content' => __('All scheduled donations have been made.', 'usaepay-payments')]);
+      return 'completed';
+    }
+    return 'charged';
+  }
+
   private function recordSuccess(Subscription $subscription, array $response, string $installment): string {
     $id = (int) $subscription->id;
     $transaction = Shared::transactionReference($response);
-    if ($transaction !== '' && give()->donations->getByGatewayTransactionId($transaction)) {
-      // Should not happen (the pending-marker path handles this case); never
-      // move the renewal date here, that would skip an installment.
-      Log::error('GiveWP renewal already recorded', ['subscription' => $id, 'transaction' => $transaction]);
+    $existing = $transaction !== '' ? give()->donations->getByGatewayTransactionId($transaction) : NULL;
+    if ($existing) {
+      // Reached only through the pending-marker path, which handles this
+      // before charging; kept so a renewal date is never moved twice here.
+      $outcome = $this->finishRecorded($subscription, $existing, $transaction);
+      if ($outcome !== NULL) {
+        return $outcome;
+      }
+      Log::error('GiveWP renewal already recorded for an earlier period', ['subscription' => $id, 'transaction' => $transaction]);
       $this->clearMarker($id);
       return 'skipped';
     }
@@ -224,6 +289,8 @@ final class Renewals {
       $subscription->status = SubscriptionStatus::ACTIVE();
     }
     $subscription->save();
+    // The donation, which carries the transaction key, is the commit point:
+    // a run that dies after it is finished by finishRecorded() next time.
     $donation = $subscription->createRenewal(['gatewayTransactionId' => $transaction]);
     DonationNote::create([
       'donationId' => $donation->id,

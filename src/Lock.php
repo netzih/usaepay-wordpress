@@ -17,14 +17,39 @@ final class Lock {
   private const PREFIX = 'usaepay_lock_';
 
   /**
+   * In-process lock table used instead of the database, for unit tests that
+   * run without WordPress. NULL in production.
+   *
+   * @var array<string, string>|null
+   */
+  private static ?array $memory = NULL;
+
+  /**
+   * Keep locks in memory instead of wp_options. Only for tests: an in-process
+   * table cannot exclude a second PHP process.
+   */
+  public static function useMemory(bool $on = TRUE): void {
+    self::$memory = $on ? [] : NULL;
+  }
+
+  /**
    * @return string|null
    *   A handle to pass to release(), or NULL when someone else holds the lock.
    */
   public static function acquire(string $name, int $ttlSeconds): ?string {
-    global $wpdb;
     $option = self::option($name);
     $now = time();
     $handle = $now . ':' . bin2hex(random_bytes(8));
+    if (self::$memory !== NULL) {
+      $current = self::$memory[$option] ?? '';
+      $heldSince = (int) strtok($current, ':');
+      if ($current !== '' && ($heldSince <= 0 || $heldSince + $ttlSeconds >= $now)) {
+        return NULL;
+      }
+      self::$memory[$option] = $handle;
+      return $handle;
+    }
+    global $wpdb;
     $suppress = $wpdb->suppress_errors(TRUE);
     try {
       $inserted = $wpdb->query($wpdb->prepare(
@@ -59,6 +84,12 @@ final class Lock {
 
   public static function release(string $name, ?string $handle): void {
     if ($handle === NULL || $handle === '') {
+      return;
+    }
+    if (self::$memory !== NULL) {
+      if ((self::$memory[self::option($name)] ?? NULL) === $handle) {
+        unset(self::$memory[self::option($name)]);
+      }
       return;
     }
     global $wpdb;

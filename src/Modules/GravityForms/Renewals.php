@@ -24,6 +24,12 @@ final class Renewals {
 
   private const LOCK = 'gf_renewals';
 
+  /**
+   * Entry meta holding the last approved installment as applied locally:
+   * {key, scheduled, start, made, expired, next_index, next, payment_recorded}.
+   */
+  public const APPLIED = 'usaepay_installment_applied';
+
   private AddOn $addon;
 
   private Gateway $gateway;
@@ -173,8 +179,14 @@ final class Renewals {
             $this->clearMarker($id);
             $response = NULL;
           }
-          elseif ($response) {
+          elseif ($response && Gateway::approved($response)) {
+            // Either never recorded, or recorded in part by a run that died
+            // half-way: recordSuccess() finds its own record of the
+            // transaction and finishes from the same values.
             $this->addon->add_note($id, sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
+          }
+          elseif ($response) {
+            $this->addon->add_note($id, sprintf(__('USAePay shows the earlier charge %s was declined; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
           }
           else {
             $this->addon->add_note($id, sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId));
@@ -262,38 +274,67 @@ final class Renewals {
     gform_update_meta($entryId, 'usaepay_reconcile_sent_at', 0);
   }
 
+  /**
+   * Record an approved installment so that running this again for the same
+   * transaction changes nothing.
+   *
+   * Everything the charge changes locally is computed first and written as
+   * one record keyed by the transaction (the commit point); the metas the
+   * schedule and GF read are then derived from it. A run that died half-way
+   * finds the record for this transaction and derives them again from the
+   * same values, so an installment is never counted twice or skipped, whatever
+   * the entry's metas say by then. GF's own payment note is the one step that
+   * can repeat, and only when the run dies between adding it and flagging it.
+   */
   private function recordSuccess(array $entry, array $response, float $amount, \DateTimeImmutable $scheduled, \DateTimeImmutable $start, int $index, \DateTimeImmutable $now, int $length, string $unit, int $made, int $times): string {
     $id = (int) $entry['id'];
     $transaction = Gateway::transactionReference($response);
-    // Write order matters. The schedule (which makes the entry not due) is
-    // advanced before the transaction key and the marker are touched, so a
-    // crash anywhere in here can at worst duplicate a local note, never a
-    // charge: while the marker stands, the next run finds this transaction
-    // and lands here again; once the key matches, it only clears the marker.
-    $this->addon->add_subscription_payment($entry, [
-      'amount' => $amount,
-      'transaction_id' => $transaction,
-      'subscription_id' => (string) rgar($entry, 'transaction_id'),
-      'payment_method' => Gateway::card($response)['brand'] ?: '',
-      'note' => sprintf(__('Installment for %1$s charged via USAePay. %2$s', 'usaepay-payments'), $scheduled->format('Y-m-d'), $this->addon->gatewayNote($response)),
-    ]);
-    $made++;
-    gform_update_meta($id, 'usaepay_payments_made', $made);
+    $applied = gform_get_meta($id, self::APPLIED);
+    if (!is_array($applied) || (string) ($applied['key'] ?? '') !== $transaction) {
+      $made++;
+      $applied = [
+        'key' => $transaction,
+        'scheduled' => $scheduled->format('Y-m-d H:i:s'),
+        'start' => $start->format('Y-m-d H:i:s'),
+        'made' => $made,
+        'expired' => $times > 0 && $made >= $times,
+        'payment_recorded' => FALSE,
+      ];
+      if (!$applied['expired']) {
+        [$nextIndex, $next] = Schedule::nextInstallmentAfter($start, $now, $length, $unit, $index + 1);
+        $applied['next_index'] = $nextIndex;
+        $applied['next'] = $next->format('Y-m-d H:i:s');
+      }
+      gform_update_meta($id, self::APPLIED, $applied);
+    }
+    if (empty($applied['payment_recorded'])) {
+      $this->addon->add_subscription_payment($entry, [
+        'amount' => $amount,
+        'transaction_id' => $transaction,
+        'subscription_id' => (string) rgar($entry, 'transaction_id'),
+        'payment_method' => Gateway::card($response)['brand'] ?: '',
+        'note' => sprintf(__('Installment for %1$s charged via USAePay. %2$s', 'usaepay-payments'), substr((string) $applied['scheduled'], 0, 10), $this->addon->gatewayNote($response)),
+      ]);
+      $applied['payment_recorded'] = TRUE;
+      gform_update_meta($id, self::APPLIED, $applied);
+    }
+    gform_update_meta($id, 'usaepay_payments_made', (int) $applied['made']);
     gform_update_meta($id, 'usaepay_failed_attempts', 0);
 
-    if ($times > 0 && $made >= $times) {
-      $entry['payment_status'] = 'Active';
-      $this->addon->expire_subscription($entry, ['note' => sprintf(__('All %d scheduled payments have been made.', 'usaepay-payments'), $times)]);
-      gform_update_meta($id, 'usaepay_next_charge', '');
+    if (!empty($applied['expired'])) {
       gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
       $this->clearMarker($id);
+      if (strtolower((string) rgar($entry, 'payment_status')) !== 'expired') {
+        $entry['payment_status'] = 'Active';
+        $this->addon->expire_subscription($entry, ['note' => sprintf(__('All %d scheduled payments have been made.', 'usaepay-payments'), $times)]);
+      }
+      gform_update_meta($id, 'usaepay_next_charge', '');
       return 'expired';
     }
-    [$nextIndex, $next] = Schedule::nextInstallmentAfter($start, $now, $length, $unit, $index + 1);
-    gform_update_meta($id, 'usaepay_schedule_start', $start->format('Y-m-d H:i:s'));
-    gform_update_meta($id, 'usaepay_installment_index', $nextIndex);
-    gform_update_meta($id, 'usaepay_scheduled_date', $next->format('Y-m-d H:i:s'));
-    gform_update_meta($id, 'usaepay_next_charge', $next->format('Y-m-d H:i:s'));
+    gform_update_meta($id, 'usaepay_schedule_start', (string) $applied['start']);
+    gform_update_meta($id, 'usaepay_installment_index', (int) $applied['next_index']);
+    gform_update_meta($id, 'usaepay_scheduled_date', (string) $applied['next']);
+    gform_update_meta($id, 'usaepay_next_charge', (string) $applied['next']);
     gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
     $this->clearMarker($id);
     return 'charged';

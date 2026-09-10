@@ -16,6 +16,7 @@ use Give\Subscriptions\Models\SubscriptionNote;
 use Give\Subscriptions\ValueObjects\SubscriptionStatus;
 use Usaepay\AmbiguousGatewayException;
 use Usaepay\ReconciliationInconclusiveException;
+use Usaepay\WordPress\BusyException;
 use Usaepay\WordPress\Reconcile;
 use Usaepay\DonorMessage;
 use Usaepay\GatewayException;
@@ -164,7 +165,7 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
         }
       }
     }
-    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException | BusyException $e) {
       Log::error('GiveWP refund unresolved', ['donation' => $donation->id, 'error' => $e->getMessage()]);
       $message = Reconcile::refundBlockedMessage($e, $reference);
       DonationNote::create(['donationId' => $donation->id, 'content' => $message]);
@@ -314,6 +315,16 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
     catch (\InvalidArgumentException $e) {
       Log::error('GiveWP: invalid request', ['donation' => $donation->id, 'error' => $e->getMessage()]);
       throw new PaymentGatewayException(__('The payment could not be processed. Please check the card details and try again, or contact us for help.', 'usaepay-payments'));
+    }
+    catch (BusyException $e) {
+      Log::debug('GiveWP: busy', ['donation' => $donation->id, 'error' => $e->getMessage()]);
+      throw new PaymentGatewayException(Reconcile::busyMessage());
+    }
+    catch (\RuntimeException $e) {
+      // The marker could not be stored; nothing was sent.
+      Log::error('GiveWP: not sent', ['donation' => $donation->id, 'error' => $e->getMessage()]);
+      DonationNote::create(['donationId' => $donation->id, 'content' => sprintf(__('USAePay charge not sent: %s', 'usaepay-payments'), $e->getMessage())]);
+      throw new PaymentGatewayException(__('The payment could not be processed right now. Please try again in a moment, or contact us for help.', 'usaepay-payments'));
     }
     if (!Shared::approved($response)) {
       $failure = Shared::failure($response);

@@ -220,65 +220,117 @@ class GatewayClient {
    *   When given, only a row for this amount counts; a row with the orderid
    *   but another amount is ignored. Guards against orderid reuse.
    * @param string[] $types
-   *   trantype_code values that count (TYPES_CHARGE or TYPES_REFUND). Rows
-   *   without a type code always count.
+   *   trantype_code values that count (TYPES_CHARGE or TYPES_REFUND).
+   * @param string[] $excludeKeys
+   *   Transaction keys that are known already and never count: the refunds a
+   *   sale had before a new one was sent, since all of them share its orderid.
    *
    * @return array|null
    *   The transaction row (with 'key', 'result_code', 'trantype_code',
    *   'status_code', 'amount', 'creditcard'), or NULL when the orderid is
    *   provably absent: the listing ran out, or every row newer than the cutoff
-   *   was checked.
+   *   was checked. Voided rows never count: no money moved.
    *
    * @throws ReconciliationInconclusiveException
    *   When $maxPages were read without finding the orderid or reaching the
-   *   cutoff (or, with no cutoff, the end of the listing).
+   *   cutoff (or, with no cutoff, the end of the listing); or when a row with
+   *   the orderid lacks the type or amount needed to tell whether it counts.
    */
-  public function findTransactionByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5, ?string $amount = NULL, array $types = self::TYPES_CHARGE): ?array {
+  public function findTransactionByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5, ?string $amount = NULL, array $types = self::TYPES_CHARGE, array $excludeKeys = []): ?array {
+    $rows = $this->scanForOrderId($orderId, $sentAt, $maxPages, $amount, $types, $excludeKeys, TRUE);
+    return $rows[0] ?? NULL;
+  }
+
+  /**
+   * Every listed transaction with this orderid, amount and type, newest first
+   * (see findTransactionByOrderId() for the arguments and the cutoff rule).
+   * Used before a refund is sent, to know which refunds of the sale existed
+   * already: refunds inherit the sale's orderid, so only the keys tell them
+   * apart.
+   *
+   * @return array[]
+   *
+   * @throws ReconciliationInconclusiveException
+   *   When the listing could not be read back to the cutoff.
+   */
+  public function findTransactionsByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5, ?string $amount = NULL, array $types = self::TYPES_CHARGE, array $excludeKeys = []): array {
+    return $this->scanForOrderId($orderId, $sentAt, $maxPages, $amount, $types, $excludeKeys, FALSE);
+  }
+
+  /**
+   * @return array[]
+   */
+  private function scanForOrderId(string $orderId, ?int $sentAt, int $maxPages, ?string $amount, array $types, array $excludeKeys, bool $firstOnly): array {
     $orderId = trim($orderId);
     if ($orderId === '') {
       throw new \InvalidArgumentException('An orderid is required.');
     }
     $cutoff = $sentAt !== NULL ? $sentAt - self::CREATED_TIME_SLACK : NULL;
     $amount = $amount === NULL ? NULL : $this->normalizeAmount($amount);
+    $excludeKeys = array_map('strval', $excludeKeys);
     $pageSize = 100;
+    $matches = [];
     for ($page = 0; $page < max(1, $maxPages); $page++) {
       $rows = $this->listTransactions($pageSize, $page * $pageSize);
       foreach ($rows as $row) {
-        if (is_array($row) && (string) ($row['orderid'] ?? '') === $orderId && self::matches($row, $amount, $types)) {
-          return $row;
+        if (is_array($row) && (string) ($row['orderid'] ?? '') === $orderId
+          && !in_array((string) ($row['key'] ?? ''), $excludeKeys, TRUE)
+          && self::matches($row, $orderId, $amount, $types)) {
+          $matches[] = $row;
+          if ($firstOnly) {
+            return $matches;
+          }
         }
         if ($cutoff !== NULL) {
           $created = self::createdTime($row);
           if ($created !== NULL && $created < $cutoff) {
-            return NULL;
+            return $matches;
           }
         }
       }
       if (count($rows) < $pageSize) {
-        return NULL;
+        return $matches;
       }
     }
     throw new ReconciliationInconclusiveException(sprintf(
-      'The newest %d USAePay transactions do not carry orderid %s, and older ones were not checked.',
+      'The newest %d USAePay transactions were read without reaching those older than orderid %s could be, so it may exist among older ones.',
       max(1, $maxPages) * $pageSize,
       $orderId
     ));
   }
 
   /**
-   * The row has one of the wanted types and the expected amount. Rows without
-   * a type code are accepted.
+   * Whether a row carrying our orderid is the transaction looked for: one of
+   * the wanted types, the expected amount, and not voided. A row that lacks
+   * the type code or (when an amount is wanted) the amount cannot be judged
+   * either way, and reconciling on a guess is exactly what this is here to
+   * prevent.
+   *
+   * A voided sale is listed (verified against the sandbox) with trantype_code
+   * 'V' ("Voided Credit Card Sale"), status 'Voided' and status_code still
+   * 'P', so the type filter alone excludes it; the status checks are there
+   * in case a future listing keeps the original type.
+   *
+   * @throws ReconciliationInconclusiveException
    */
-  private static function matches(array $row, ?string $amount, array $types): bool {
+  private static function matches(array $row, string $orderId, ?string $amount, array $types): bool {
     $type = strtoupper(trim((string) ($row['trantype_code'] ?? '')));
-    if ($type !== '' && !in_array($type, $types, TRUE)) {
+    if ($type === '') {
+      throw new ReconciliationInconclusiveException(sprintf('USAePay lists transaction %s for orderid %s without a transaction type.', (string) ($row['key'] ?? '?'), $orderId));
+    }
+    if (!in_array($type, $types, TRUE)) {
       return FALSE;
     }
-    if ($amount !== NULL && isset($row['amount']) && is_numeric($row['amount'])
-      && abs((float) $row['amount'] - (float) $amount) >= 0.005) {
-      return FALSE;
+    if ($amount !== NULL) {
+      if (!isset($row['amount']) || !is_numeric($row['amount'])) {
+        throw new ReconciliationInconclusiveException(sprintf('USAePay lists transaction %s for orderid %s without an amount.', (string) ($row['key'] ?? '?'), $orderId));
+      }
+      if (abs((float) $row['amount'] - (float) $amount) >= 0.005) {
+        return FALSE;
+      }
     }
-    return TRUE;
+    return strtoupper(trim((string) ($row['status_code'] ?? ''))) !== 'V'
+      && strtolower(trim((string) ($row['status'] ?? ''))) !== 'voided';
   }
 
   /**

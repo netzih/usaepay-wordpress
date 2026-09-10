@@ -9,6 +9,7 @@ use Usaepay\ReconciliationInconclusiveException;
 use Usaepay\WordPress\Gateway as Shared;
 use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Plugin;
+use Usaepay\WordPress\BusyException;
 use Usaepay\WordPress\Reconcile;
 
 /**
@@ -559,7 +560,7 @@ final class Gateway extends \WC_Payment_Gateway {
         }
       }
     }
-    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException | BusyException $e) {
       $this->log('Refund unresolved for order ' . $order_id . ': ' . $e->getMessage(), 'error');
       return new \WP_Error('usaepay', Reconcile::refundBlockedMessage($e, $reference));
     }
@@ -856,6 +857,19 @@ final class Gateway extends \WC_Payment_Gateway {
     catch (\InvalidArgumentException $e) {
       $this->log('Invalid request: ' . $e->getMessage(), 'error');
       return ['error' => __('The payment could not be processed. Please check the card details and try again, or contact us for help.', 'usaepay-payments'), 'gateway' => $e->getMessage()];
+    }
+    catch (BusyException $e) {
+      // A second request for the same order while the first is still out.
+      $this->log('Busy: ' . $e->getMessage(), 'info');
+      return ['error' => Reconcile::busyMessage(), 'gateway' => $e->getMessage()];
+    }
+    catch (\RuntimeException $e) {
+      // The marker could not be stored; nothing was sent.
+      $this->log('Not sent: ' . $e->getMessage(), 'error');
+      if ($order) {
+        $order->add_order_note(sprintf(__('USAePay charge not sent: %s', 'usaepay-payments'), $e->getMessage()));
+      }
+      return ['error' => __('The payment could not be processed right now. Please try again in a moment, or contact us for help.', 'usaepay-payments'), 'gateway' => $e->getMessage()];
     }
     if (!Shared::approved($response)) {
       $failure = Shared::failure($response);

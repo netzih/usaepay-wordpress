@@ -7,6 +7,8 @@ use Usaepay\AmbiguousGatewayException;
 use Usaepay\GatewayClient;
 use Usaepay\GatewayException;
 use Usaepay\ReconciliationInconclusiveException;
+use Usaepay\WordPress\BusyException;
+use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Reconcile;
 
 /**
@@ -19,6 +21,14 @@ final class ReconcileTest extends TestCase {
   private array $requests = [];
 
   private ?array $marker = NULL;
+
+  protected function setUp(): void {
+    Lock::useMemory();
+  }
+
+  protected function tearDown(): void {
+    Lock::useMemory(FALSE);
+  }
 
   /**
    * @param array<int, array{status: int, body: array}> $answers
@@ -167,6 +177,102 @@ final class ReconcileTest extends TestCase {
 
     self::assertTrue($result['reconciled']);
     self::assertSame('5.00', $result['amount']);
+  }
+
+  public function testConcurrentRequestForTheSameOrderIdSendsNothing(): void {
+    $client = $this->client([['status' => 200, 'body' => ['result_code' => 'A', 'key' => 'new']]]);
+    [$read, $write] = $this->store();
+    $held = Lock::acquire('reconcile_' . md5('abc-wc-1'), 300);
+    self::assertNotNull($held);
+
+    try {
+      Reconcile::once($client, $read, $write, 'abc-wc-1', '2.00', $this->sale());
+      self::fail('Expected a BusyException.');
+    }
+    catch (BusyException $e) {
+      self::assertCount(0, $this->requests);
+      self::assertNull($this->marker);
+    }
+    Lock::release('reconcile_' . md5('abc-wc-1'), $held);
+
+    // Released: the next request goes through and leaves its lock behind.
+    $result = Reconcile::once($client, $read, $write, 'abc-wc-1', '2.00', $this->sale());
+    self::assertSame('new', $result['response']['key']);
+    self::assertNotNull(Lock::acquire('reconcile_' . md5('abc-wc-1'), 300));
+  }
+
+  public function testAMarkerThatCannotBeStoredStopsTheRequest(): void {
+    $client = $this->client([['status' => 200, 'body' => ['result_code' => 'A', 'key' => 'new']]]);
+    $read = static fn() => NULL;
+    $write = static function (?array $marker): void {};
+
+    try {
+      Reconcile::once($client, $read, $write, 'abc-wc-1', '2.00', $this->sale());
+      self::fail('Expected the request to be refused.');
+    }
+    catch (\RuntimeException $e) {
+      self::assertNotInstanceOf(GatewayException::class, $e);
+      self::assertCount(0, $this->requests);
+    }
+  }
+
+  public function testRefundRemembersTheRefundsThatExistedBeforeIt(): void {
+    $client = $this->client([
+      // The snapshot of refunds the sale already has.
+      ['status' => 200, 'body' => ['type' => 'list', 'data' => [
+        ['key' => 'r1', 'orderid' => 'abc-wc-1', 'trantype_code' => 'C', 'amount' => '5.00', 'result_code' => 'A', 'created' => gmdate('Y-m-d H:i:s')],
+        ['key' => 'sale', 'orderid' => 'abc-wc-1', 'trantype_code' => 'S', 'amount' => '20.00', 'result_code' => 'A', 'created' => gmdate('Y-m-d H:i:s')],
+      ]]],
+      ['status' => 200, 'body' => ['result_code' => 'A', 'key' => 'r2']],
+    ]);
+    [$read, $write] = $this->store();
+
+    $result = Reconcile::once($client, $read, $write, 'abc-wc-1', '5.00', static fn(GatewayClient $c) => $c->refund('sale', '5.00'), GatewayClient::TYPES_REFUND);
+
+    self::assertSame('r2', $result['response']['key']);
+    self::assertSame(['r1'], $this->marker['exclude']);
+    self::assertCount(2, $this->requests);
+    self::assertSame('GET', $this->requests[0]['method']);
+    self::assertSame('POST', $this->requests[1]['method']);
+  }
+
+  public function testRepeatedEqualRefundIsNotReconciledToTheEarlierOne(): void {
+    // A second $5 refund was sent and its answer lost; only r1 existed before.
+    $this->marker = ['orderid' => 'abc-wc-1', 'sent_at' => time() - 600, 'amount' => '5.00', 'exclude' => ['r1']];
+    $listing = ['type' => 'list', 'data' => [
+      ['key' => 'r1', 'orderid' => 'abc-wc-1', 'trantype_code' => 'C', 'amount' => '5.00', 'result_code' => 'A', 'created' => gmdate('Y-m-d H:i:s', time() - 900)],
+      ['key' => 'old', 'orderid' => 'other', 'created' => '2020-01-01 00:00:00'],
+    ]];
+    $client = $this->client([
+      ['status' => 200, 'body' => $listing],
+      ['status' => 200, 'body' => $listing],
+      ['status' => 200, 'body' => ['result_code' => 'A', 'key' => 'r2']],
+    ]);
+    [$read, $write] = $this->store();
+
+    $result = Reconcile::once($client, $read, $write, 'abc-wc-1', '5.00', static fn(GatewayClient $c) => $c->refund('sale', '5.00'), GatewayClient::TYPES_REFUND);
+
+    // r1 is excluded, so the lost refund provably never happened: sent again.
+    self::assertFalse($result['reconciled']);
+    self::assertSame('r2', $result['response']['key']);
+    self::assertSame(['r1'], $this->marker['exclude']);
+  }
+
+  public function testRepeatedEqualRefundThatWentThroughIsFound(): void {
+    $this->marker = ['orderid' => 'abc-wc-1', 'sent_at' => time() - 600, 'amount' => '5.00', 'exclude' => ['r1']];
+    $client = $this->client([
+      ['status' => 200, 'body' => ['type' => 'list', 'data' => [
+        ['key' => 'r2', 'orderid' => 'abc-wc-1', 'trantype_code' => 'C', 'amount' => '5.00', 'result_code' => 'A', 'created' => gmdate('Y-m-d H:i:s', time() - 500)],
+        ['key' => 'r1', 'orderid' => 'abc-wc-1', 'trantype_code' => 'C', 'amount' => '5.00', 'result_code' => 'A', 'created' => gmdate('Y-m-d H:i:s', time() - 900)],
+      ]]],
+    ]);
+    [$read, $write] = $this->store();
+
+    $result = Reconcile::once($client, $read, $write, 'abc-wc-1', '5.00', static fn(GatewayClient $c) => $c->refund('sale', '5.00'), GatewayClient::TYPES_REFUND);
+
+    self::assertTrue($result['reconciled']);
+    self::assertSame('r2', $result['response']['key']);
+    self::assertCount(1, $this->requests);
   }
 
 }

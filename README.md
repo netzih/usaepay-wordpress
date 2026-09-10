@@ -142,9 +142,38 @@ nothing is sent and the admin or payer is told to wait or get in touch. Stores:
 WooCommerce order meta (`_usaepay_charge_sent`, `_usaepay_refund_sent`,
 `_usaepay_renewal_pending`), GiveWP donation meta (`_usaepay_charge_sent`,
 `_usaepay_refund_sent`), Gravity Forms entry meta (`usaepay_reconcile_*`,
-`usaepay_refund_sent`) and, for a submission that has no entry yet, a transient
-keyed by the submission's `orderid`. Cron workers hold a lock row in
-`wp_options` (inserted, not read-then-written) with an owner handle.
+`usaepay_refund_sent`) and, for a submission that has no entry yet, a row in
+`wp_options` (`usaepay_marker_*`, written with plain SQL so no object cache can
+drop it; purged after seven days by the hourly Gravity Forms cron).
+
+Reading the marker, storing it and sending the request happen under a lock on
+the `orderid` (a row inserted into `wp_options`, so the insert itself is the
+test), and the stored marker is read back before anything is sent. Two requests
+for the same order at the same moment therefore cannot both charge: the second
+is told the payment is already being processed. Cron workers hold the same kind
+of lock per subscription and per run.
+
+A refund inherits the sale's `orderid`, so two refunds of the same amount look
+alike. Before a refund is sent, the refunds the sale already has are listed and
+their keys stored with the marker; a later lookup counts only a refund that was
+not there before. A listed row that carries the `orderid` but no type or amount
+is treated as inconclusive rather than matched, and a voided transaction never
+counts.
+
+Renewal success is recorded so that running it twice for the same transaction
+changes nothing. Gravity Forms writes one record per approved installment
+(`usaepay_installment_applied`: transaction key, new count, next date) before
+touching the metas the schedule reads; a run that dies half-way derives them
+again from that record. GiveWP records the renewal donation first and, when a
+run died before the renewal date moved, moves it on the next run instead of
+charging the period again (a donation created after the current renewal date is
+this period's; one created before it belongs to an earlier period, so the
+marker is a leftover and the period is charged).
+
+A signup whose answer was lost is recovered from the listing without the
+saved-card key (USAePay's listing and transaction detail carry no
+`savedcard`, verified against the sandbox), so a subscription signup recovered
+that way is voided and the payer is asked for the card again.
 
 ### Entry meta written by the add-on
 
@@ -153,8 +182,9 @@ keyed by the submission's `orderid`. Cron workers hold a lock row in
 also `usaepay_card_reference`, `usaepay_interval_length/unit`,
 `usaepay_recurring_times`, `usaepay_payments_made`, `usaepay_failed_attempts`,
 `usaepay_schedule_start`, `usaepay_installment_index`, `usaepay_scheduled_date`,
-`usaepay_next_charge`, `usaepay_last_transaction_key`, and while a charge is in
-flight `usaepay_reconcile_order_id` / `usaepay_reconcile_sent_at`. A subscription created in
+`usaepay_next_charge`, `usaepay_last_transaction_key`,
+`usaepay_installment_applied`, and while a charge is in flight
+`usaepay_reconcile_order_id` / `usaepay_reconcile_sent_at`. A subscription created in
 sandbox mode is skipped by the renewal worker while the plugin is in live mode
 (and vice versa).
 

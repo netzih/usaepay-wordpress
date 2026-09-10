@@ -4,6 +4,7 @@ namespace Usaepay\WordPress\Modules\GravityForms;
 
 use Usaepay\AmbiguousGatewayException;
 use Usaepay\ReconciliationInconclusiveException;
+use Usaepay\WordPress\BusyException;
 use Usaepay\WordPress\Reconcile;
 use Usaepay\GatewayException;
 use Usaepay\WordPress\Gateway;
@@ -384,6 +385,7 @@ final class AddOn extends \GFPaymentAddOn {
    */
   public function check_status() {
     $summary = (new Renewals($this, $this->gateway(), Plugin::instance()->settings()))->run();
+    $summary['purged_markers'] = Reconcile::purgeOptionMarkers();
     $this->log_debug(__METHOD__ . '(): ' . wp_json_encode($summary));
   }
 
@@ -483,7 +485,7 @@ final class AddOn extends \GFPaymentAddOn {
         }
       }
     }
-    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException | BusyException $e) {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
       wp_send_json_error(['message' => Reconcile::refundBlockedMessage($e, $reference)]);
     }
@@ -609,7 +611,7 @@ final class AddOn extends \GFPaymentAddOn {
     $reconciled = FALSE;
     try {
       if ($orderId !== NULL) {
-        [$read, $write] = Reconcile::transientStore('gf:' . $orderId);
+        [$read, $write] = Reconcile::optionStore('gf:' . $orderId);
         $result = Reconcile::once($client, $read, $write, $orderId, $amount, $call);
         $response = $result['response'];
         $reconciled = $result['reconciled'];
@@ -636,6 +638,17 @@ final class AddOn extends \GFPaymentAddOn {
     catch (\InvalidArgumentException $e) {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
       return ['error' => __('The payment could not be processed. Please check the card details and try again, or contact us for help.', 'usaepay-payments')];
+    }
+    catch (BusyException $e) {
+      // The same submission sent twice at once (a double click that got past
+      // the form's own guard); the first one is still out.
+      $this->log_debug(__METHOD__ . '(): busy: ' . $e->getMessage());
+      return ['error' => Reconcile::busyMessage()];
+    }
+    catch (\RuntimeException $e) {
+      // The marker could not be stored; nothing was sent.
+      $this->log_error(__METHOD__ . '(): not sent: ' . $e->getMessage());
+      return ['error' => __('The payment could not be processed right now. Please try again in a moment, or contact us for help.', 'usaepay-payments')];
     }
     if (!Gateway::approved($response)) {
       $failure = Gateway::failure($response);

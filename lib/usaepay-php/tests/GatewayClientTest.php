@@ -200,7 +200,7 @@ final class GatewayClientTest extends TestCase {
     $urls = [];
     $pages = [
       array_map(static fn($i) => ['key' => "k$i", 'orderid' => "other-$i"], range(1, 100)),
-      [['key' => 'k-old', 'orderid' => 'other-x'], ['key' => 'wanted', 'orderid' => 'usaepayjs-7-2026-09-09-0', 'result_code' => 'A']],
+      [['key' => 'k-old', 'orderid' => 'other-x'], ['key' => 'wanted', 'orderid' => 'usaepayjs-7-2026-09-09-0', 'trantype_code' => 'S', 'result_code' => 'A']],
     ];
     $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function (string $method, string $url) use (&$urls, &$pages): array {
       $urls[] = $url;
@@ -234,7 +234,7 @@ final class GatewayClientTest extends TestCase {
     $rows = [
       ['key' => 'k1', 'orderid' => 'other-1', 'created' => '2026-09-09 12:05:00'],
       ['key' => 'k2', 'orderid' => 'other-2', 'created' => '2026-09-07 09:00:00'],
-      ['key' => 'k3', 'orderid' => 'usaepayjs-7-2026-09-09-0', 'created' => '2026-09-01 09:00:00'],
+      ['key' => 'k3', 'orderid' => 'usaepayjs-7-2026-09-09-0', 'trantype_code' => 'S', 'created' => '2026-09-01 09:00:00'],
     ];
     $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function () use (&$calls, $rows): array {
       $calls++;
@@ -287,6 +287,50 @@ final class GatewayClientTest extends TestCase {
     // Refunds inherit the sale's orderid, so the type is what tells them apart.
     self::assertSame('refund', $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND)['key']);
     self::assertNull($client->findTransactionByOrderId('wc-9', NULL, 5, '6.00', GatewayClient::TYPES_REFUND));
+  }
+
+  public function testFindTransactionByOrderIdSkipsExcludedKeysAndVoidedRows(): void {
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function (): array {
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => [
+        ['key' => 'voided', 'orderid' => 'wc-9', 'trantype_code' => 'C', 'amount' => 5.00, 'result_code' => 'A', 'status_code' => 'V'],
+        // As the sandbox lists a voided sale: the type changes, status_code does not.
+        ['key' => 'voided-sale', 'orderid' => 'wc-9', 'trantype_code' => 'V', 'amount' => 5.00, 'result_code' => 'A', 'status_code' => 'P', 'status' => 'Voided'],
+        ['key' => 'voided-text', 'orderid' => 'wc-9', 'trantype_code' => 'C', 'amount' => 5.00, 'result_code' => 'A', 'status_code' => 'P', 'status' => 'Voided'],
+        ['key' => 'second', 'orderid' => 'wc-9', 'trantype_code' => 'C', 'amount' => 5.00, 'result_code' => 'A', 'status_code' => 'P'],
+        ['key' => 'first', 'orderid' => 'wc-9', 'trantype_code' => 'C', 'amount' => 5.00, 'result_code' => 'A', 'status_code' => 'S'],
+        ['key' => 'sale', 'orderid' => 'wc-9', 'trantype_code' => 'S', 'amount' => 20.00, 'result_code' => 'A', 'status_code' => 'S'],
+      ]])];
+    });
+
+    self::assertSame('second', $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND)['key']);
+    // The refunds known before a new one was sent do not count as the new one.
+    self::assertSame('second', $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND, ['first'])['key']);
+    self::assertNull($client->findTransactionByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND, ['first', 'second']));
+    self::assertSame(['second', 'first'], array_column($client->findTransactionsByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND), 'key'));
+    self::assertSame([], $client->findTransactionsByOrderId('wc-9', NULL, 5, '6.00', GatewayClient::TYPES_REFUND));
+  }
+
+  public function testRowWithTheOrderIdButNoTypeOrAmountIsInconclusive(): void {
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function (): array {
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => [
+        ['key' => 'typeless', 'orderid' => 'wc-9', 'amount' => 5.00, 'result_code' => 'A'],
+      ]])];
+    });
+    try {
+      $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00');
+      self::fail('A row without a type cannot be judged.');
+    }
+    catch (\Usaepay\ReconciliationInconclusiveException $e) {
+      self::assertStringContainsString('typeless', $e->getMessage());
+    }
+
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function (): array {
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => [
+        ['key' => 'amountless', 'orderid' => 'wc-9', 'trantype_code' => 'S', 'result_code' => 'A'],
+      ]])];
+    });
+    $this->expectException(\Usaepay\ReconciliationInconclusiveException::class);
+    $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00');
   }
 
   public function testRateLimitIsAmbiguous(): void {
