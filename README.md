@@ -13,13 +13,23 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
 ## Installation
 
 Download `usaepay-payments-<version>.zip` from the
-[latest release](https://github.com/netzih/usaepay-wordpress/releases/latest)
-(the repository is private, so sign in to GitHub first). In WordPress go to
-**Plugins > Add New Plugin > Upload Plugin**, choose the zip, press **Install
-Now**, then **Activate**. The zip carries everything the plugin runs on,
-including the bundled USAePay client library; no Composer or shell access is
-needed on the site. To upgrade, upload the newer zip the same way and confirm
-**Replace current with uploaded** when WordPress asks.
+[latest release](https://github.com/netzih/usaepay-wordpress/releases/latest).
+In WordPress go to **Plugins > Add New Plugin > Upload Plugin**, choose the
+zip, press **Install Now**, then **Activate**. The zip carries everything the
+plugin runs on, including the bundled USAePay client library; no Composer or
+shell access is needed on the site. To upgrade, upload the newer zip the same
+way and confirm **Replace current with uploaded** when WordPress asks.
+
+With wp-cli, install the release asset straight from GitHub (`--force`
+upgrades over an installed copy):
+
+```
+wp plugin install https://github.com/netzih/usaepay-wordpress/releases/download/v0.1.2/usaepay-payments-0.1.2.zip --force --activate
+```
+
+A source archive of the repository is not installable: `vendor/` is not
+committed, so only the release zip (or `bin/build-zip.sh`) carries the
+dependencies.
 
 Requirements: WordPress 6.4+, PHP 8.1+ with curl and json, and at least one of
 Gravity Forms 2.9+, GiveWP 4 or WooCommerce 8 (WooCommerce Subscriptions for
