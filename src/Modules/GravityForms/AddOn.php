@@ -3,6 +3,8 @@
 namespace Usaepay\WordPress\Modules\GravityForms;
 
 use Usaepay\AmbiguousGatewayException;
+use Usaepay\ReconciliationInconclusiveException;
+use Usaepay\WordPress\Reconcile;
 use Usaepay\GatewayException;
 use Usaepay\WordPress\Gateway;
 use Usaepay\WordPress\Log;
@@ -222,7 +224,7 @@ final class AddOn extends \GFPaymentAddOn {
     }
 
     $uniqueId = $this->submissionId($form);
-    $orderId = 'gf-' . (int) $form['id'] . '-' . $uniqueId;
+    $orderId = Gateway::orderId('gf-' . (int) $form['id'] . '-' . $uniqueId);
     $payer = $this->payer($submission_data);
     $metadata = $this->gateway()->metadata(
       'GF' . (int) $form['id'] . '-' . substr($uniqueId, 0, 12),
@@ -231,7 +233,7 @@ final class AddOn extends \GFPaymentAddOn {
       ['currency' => \GFCommon::get_currency(), 'orderid' => $orderId]
     );
 
-    $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($amount), $metadata), $orderId);
+    $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($amount), $metadata), $orderId, self::money($amount));
     if (!empty($outcome['error'])) {
       return $this->authorization_error($outcome['error']);
     }
@@ -286,7 +288,7 @@ final class AddOn extends \GFPaymentAddOn {
     $firstAmount = $trialEnabled ? $trialAmount : $recurring + $setupFee;
     $uniqueId = $this->submissionId($form);
     $subscriptionId = 'gf-sub-' . substr($uniqueId, 0, 16);
-    $orderId = 'gf-' . (int) $form['id'] . '-' . $uniqueId;
+    $orderId = Gateway::orderId('gf-' . (int) $form['id'] . '-' . $uniqueId);
     $payer = $this->payer($submission_data);
     $metadata = $this->gateway()->metadata(
       'GF' . (int) $form['id'] . '-' . substr($uniqueId, 0, 12),
@@ -296,10 +298,10 @@ final class AddOn extends \GFPaymentAddOn {
     );
 
     if ($firstAmount > 0) {
-      $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($firstAmount), $metadata, TRUE), $orderId);
+      $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, self::money($firstAmount), $metadata, TRUE), $orderId, self::money($firstAmount));
     }
     else {
-      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($key, $metadata), NULL);
+      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($key, $metadata), $orderId, \Usaepay\GatewayClient::CARD_VERIFICATION_AMOUNT);
     }
     if (!empty($outcome['error'])) {
       return $this->authorization_error($outcome['error']);
@@ -459,9 +461,31 @@ final class AddOn extends \GFPaymentAddOn {
         $action = 'void';
       }
       else {
-        $response = $client->refund($reference, self::money($amount));
         $action = 'refund';
+        // Refunds inherit the sale's orderid at USAePay. A marker on the entry
+        // makes sure a refund whose answer was lost is found, not repeated.
+        $saleOrderId = trim((string) rgar($transaction, 'orderid'));
+        if ($saleOrderId === '') {
+          $response = $client->refund($reference, self::money($amount));
+        }
+        else {
+          [$read, $write] = Reconcile::metaStore(
+            static fn() => gform_get_meta($entry_id, 'usaepay_refund_sent'),
+            static function (array $marker) use ($entry_id): void { gform_update_meta($entry_id, 'usaepay_refund_sent', $marker); },
+            static function () use ($entry_id): void { gform_delete_meta($entry_id, 'usaepay_refund_sent'); }
+          );
+          $result = Reconcile::once($client, $read, $write, $saleOrderId, self::money($amount), static fn($c) => $c->refund($reference, self::money($amount)), \Usaepay\GatewayClient::TYPES_REFUND);
+          if ($result['reconciled'] && abs((float) $result['amount'] - $amount) >= 0.005) {
+            wp_send_json_error(['message' => Reconcile::refundMismatchMessage(\GFCommon::to_money((float) $result['amount'], $entry['currency']), Gateway::transactionReference($result['response']))]);
+          }
+          $response = $result['response'];
+          $clearRefundMarker = $write;
+        }
       }
+    }
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      wp_send_json_error(['message' => Reconcile::refundBlockedMessage($e, $reference)]);
     }
     catch (GatewayException | \InvalidArgumentException $e) {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
@@ -481,6 +505,10 @@ final class AddOn extends \GFPaymentAddOn {
         ? sprintf(__('Sale voided before settlement via USAePay. Reference: %s', 'usaepay-payments'), $refundReference)
         : sprintf(__('Refunded %1$s via USAePay. Reference: %2$s', 'usaepay-payments'), \GFCommon::to_money($amount, $entry['currency']), $refundReference),
     ]);
+    if (isset($clearRefundMarker)) {
+      // Cleared only now that the refund is recorded on the entry.
+      $clearRefundMarker(NULL);
+    }
     wp_send_json_success(['message' => $action === 'void' ? __('Voided.', 'usaepay-payments') : __('Refunded.', 'usaepay-payments')]);
   }
 
@@ -562,9 +590,15 @@ final class AddOn extends \GFPaymentAddOn {
   /**
    * Run a charge with the shared failure handling.
    *
-   * @return array{response?: array, error?: string}
+   * With an $orderId the charge is made at most once per submission: a marker
+   * keyed by the orderid (which is derived from GF's per-submission unique id,
+   * so a resubmit after an error carries the same one) is stored before the
+   * request and an earlier approval is found and reused instead of charged
+   * again. $amount is what the transaction must show to count as that charge.
+   *
+   * @return array{response?: array, error?: string, reconciled?: bool}
    */
-  public function charge(callable $call, ?string $orderId): array {
+  public function charge(callable $call, ?string $orderId, ?string $amount = NULL): array {
     try {
       $client = $this->gateway()->client(self::INTEGRATION);
     }
@@ -572,27 +606,28 @@ final class AddOn extends \GFPaymentAddOn {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
       return ['error' => __('The payment system is not configured correctly, so no charge was made. Please contact us so we can fix it.', 'usaepay-payments')];
     }
+    $reconciled = FALSE;
     try {
-      $response = $call($client);
+      if ($orderId !== NULL) {
+        [$read, $write] = Reconcile::transientStore('gf:' . $orderId);
+        $result = Reconcile::once($client, $read, $write, $orderId, $amount, $call);
+        $response = $result['response'];
+        $reconciled = $result['reconciled'];
+        if ($reconciled) {
+          $this->log_debug(__METHOD__ . '(): reconciled ' . $orderId . ' to ' . rgar($response, 'key'));
+        }
+      }
+      else {
+        $response = $call($client);
+      }
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
+      return ['error' => __('An earlier attempt to make this payment may have gone through, and the card processor could not confirm it. Nothing was charged now. Please contact us before trying again.', 'usaepay-payments')];
     }
     catch (AmbiguousGatewayException $e) {
       $this->log_error(__METHOD__ . '(): ambiguous: ' . $e->getMessage());
-      $found = NULL;
-      if ($orderId !== NULL) {
-        try {
-          $found = $client->findTransactionByOrderId($orderId, time());
-        }
-        catch (\Throwable $lookup) {
-          $this->log_error(__METHOD__ . '(): reconciliation failed: ' . $lookup->getMessage());
-        }
-      }
-      if ($found && Gateway::approved($found)) {
-        $this->log_debug(__METHOD__ . '(): reconciled ' . $orderId . ' to ' . rgar($found, 'key'));
-        $response = $found;
-      }
-      else {
-        return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments')];
-      }
+      return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments')];
     }
     catch (GatewayException $e) {
       $this->log_error(__METHOD__ . '(): ' . $e->getMessage());
@@ -612,7 +647,7 @@ final class AddOn extends \GFPaymentAddOn {
       // it expires on its own. Logged so the console can be checked.
       $this->log_error(__METHOD__ . '(): card saved but the verification hold was not voided: ' . $response['void_error']);
     }
-    return ['response' => $response];
+    return ['response' => $response, 'reconciled' => $reconciled];
   }
 
   private function postedPaymentKey(array $form): string {

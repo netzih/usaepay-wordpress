@@ -115,7 +115,9 @@
         return data;
       }
       var types = window.gform.submission || {};
-      if (data.submissionType !== types.SUBMISSION_TYPE_SUBMIT && data.submissionType !== types.SUBMISSION_TYPE_NEXT) {
+      // Only the final submit: a key minted on "Next" would be cleared when the
+      // following page renders, so the card field must be on the last page.
+      if (data.submissionType !== types.SUBMISSION_TYPE_SUBMIT) {
         return data;
       }
       var formId = parseInt(data.form.dataset.formid, 10);
@@ -123,7 +125,7 @@
       if (!h || !document.body.contains(h.container) || !h.input) {
         return data;
       }
-      // Hidden by conditional logic or on another page: nothing to tokenize now.
+      // Hidden by conditional logic: nothing to tokenize now.
       if (!visible(h.container)) {
         return data;
       }

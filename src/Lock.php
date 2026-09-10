@@ -8,54 +8,61 @@ namespace Usaepay\WordPress;
  * Transients are read-then-write and two cron workers can both pass the read;
  * here the INSERT itself is the test, because option_name is unique. The row
  * is written with plain SQL so the option caches never see it. A holder that
- * died keeps the lock only until its TTL passes.
+ * died keeps the lock only until its TTL passes; a holder that overran its
+ * TTL and lost the lock cannot release the successor's, because release
+ * deletes only the exact handle that acquire() returned.
  */
 final class Lock {
 
   private const PREFIX = 'usaepay_lock_';
 
   /**
-   * @return bool
-   *   TRUE when this caller now holds the lock.
+   * @return string|null
+   *   A handle to pass to release(), or NULL when someone else holds the lock.
    */
-  public static function acquire(string $name, int $ttlSeconds): bool {
+  public static function acquire(string $name, int $ttlSeconds): ?string {
     global $wpdb;
     $option = self::option($name);
     $now = time();
+    $handle = $now . ':' . bin2hex(random_bytes(8));
     $suppress = $wpdb->suppress_errors(TRUE);
     try {
       $inserted = $wpdb->query($wpdb->prepare(
         "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
         $option,
-        (string) $now
+        $handle
       ));
       if ($inserted === 1) {
-        return TRUE;
+        return $handle;
       }
-      $held = (int) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option));
-      if ($held <= 0) {
-        return FALSE;
+      $current = (string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option));
+      if ($current === '') {
+        return NULL;
       }
-      if ($held + $ttlSeconds >= $now) {
-        return FALSE;
+      $heldSince = (int) strtok($current, ':');
+      if ($heldSince <= 0 || $heldSince + $ttlSeconds >= $now) {
+        return NULL;
       }
       // Stale: take it over, but only from the exact value we saw.
       $taken = $wpdb->query($wpdb->prepare(
         "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
-        (string) $now,
+        $handle,
         $option,
-        (string) $held
+        $current
       ));
-      return $taken === 1;
+      return $taken === 1 ? $handle : NULL;
     }
     finally {
       $wpdb->suppress_errors($suppress);
     }
   }
 
-  public static function release(string $name): void {
+  public static function release(string $name, ?string $handle): void {
+    if ($handle === NULL || $handle === '') {
+      return;
+    }
     global $wpdb;
-    $wpdb->delete($wpdb->options, ['option_name' => self::option($name)]);
+    $wpdb->delete($wpdb->options, ['option_name' => self::option($name), 'option_value' => $handle]);
   }
 
   private static function option(string $name): string {

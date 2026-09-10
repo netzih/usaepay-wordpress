@@ -42,7 +42,8 @@ final class Renewals {
   public function run(?\DateTimeImmutable $now = NULL): array {
     $now = $now ?? new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
     $summary = ['due' => 0, 'charged' => 0, 'declined' => 0, 'cancelled' => 0, 'expired' => 0, 'skipped' => 0, 'ambiguous' => 0];
-    if (!Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS)) {
+    $lock = Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS);
+    if ($lock === NULL) {
       $summary['skipped']++;
       return $summary;
     }
@@ -54,7 +55,7 @@ final class Renewals {
       }
     }
     finally {
-      Lock::release(self::LOCK);
+      Lock::release(self::LOCK, $lock);
     }
     return $summary;
   }
@@ -115,7 +116,8 @@ final class Renewals {
       return 'skipped';
     }
     $lockKey = 'gf_renewal_' . $id;
-    if (!Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS)) {
+    $lock = Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS);
+    if ($lock === NULL) {
       return 'skipped';
     }
 
@@ -144,7 +146,7 @@ final class Renewals {
         return 'skipped';
       }
       $payer = is_array($meta('usaepay_payer')) ? $meta('usaepay_payer') : [];
-      $orderId = Schedule::orderId($id, $scheduled, $attempt);
+      $orderId = Gateway::orderId(Schedule::orderId($id, $scheduled, $attempt));
       $metadata = $this->gateway->metadata(
         Schedule::invoice($id),
         (string) $meta('usaepay_form_title') ?: sprintf(__('Gravity Forms entry %d', 'usaepay-payments'), $id),
@@ -164,8 +166,14 @@ final class Renewals {
           // A previous run sent this charge and never recorded the answer.
           // Find out what happened before sending another one; an unanswered
           // lookup keeps the marker and ends this run without a charge.
-          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL);
-          if ($response) {
+          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL, AddOn::money($amount));
+          if ($response && Gateway::transactionReference($response) === (string) $meta('usaepay_last_transaction_key')) {
+            // Recorded in full by a run that died just before clearing the
+            // marker; this run is for the next installment.
+            $this->clearMarker($id);
+            $response = NULL;
+          }
+          elseif ($response) {
             $this->addon->add_note($id, sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId));
           }
           else {
@@ -185,7 +193,7 @@ final class Renewals {
       catch (AmbiguousGatewayException $e) {
         $this->addon->log_error(__METHOD__ . "(): entry #$id ambiguous: " . $e->getMessage());
         try {
-          $found = $this->findTransaction($client, $orderId, time());
+          $found = $this->findTransaction($client, $orderId, time(), AddOn::money($amount));
         }
         catch (ReconciliationInconclusiveException $lookup) {
           $found = NULL;
@@ -216,7 +224,7 @@ final class Renewals {
       return $this->recordFailure($entry, $response, $amount, $scheduled, $now, $attempt);
     }
     finally {
-      Lock::release($lockKey);
+      Lock::release($lockKey, $lock);
     }
   }
 
@@ -228,9 +236,9 @@ final class Renewals {
    *   When the answer is unknown: the listing window ran out or the lookup
    *   itself failed. Callers must not charge.
    */
-  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt): ?array {
+  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt, string $amount): ?array {
     try {
-      return $client->findTransactionByOrderId($orderId, $sentAt);
+      return $client->findTransactionByOrderId($orderId, $sentAt, 5, $amount);
     }
     catch (ReconciliationInconclusiveException $e) {
       throw $e;
@@ -257,6 +265,11 @@ final class Renewals {
   private function recordSuccess(array $entry, array $response, float $amount, \DateTimeImmutable $scheduled, \DateTimeImmutable $start, int $index, \DateTimeImmutable $now, int $length, string $unit, int $made, int $times): string {
     $id = (int) $entry['id'];
     $transaction = Gateway::transactionReference($response);
+    // Write order matters. The schedule (which makes the entry not due) is
+    // advanced before the transaction key and the marker are touched, so a
+    // crash anywhere in here can at worst duplicate a local note, never a
+    // charge: while the marker stands, the next run finds this transaction
+    // and lands here again; once the key matches, it only clears the marker.
     $this->addon->add_subscription_payment($entry, [
       'amount' => $amount,
       'transaction_id' => $transaction,
@@ -267,13 +280,13 @@ final class Renewals {
     $made++;
     gform_update_meta($id, 'usaepay_payments_made', $made);
     gform_update_meta($id, 'usaepay_failed_attempts', 0);
-    gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
-    $this->clearMarker($id);
 
     if ($times > 0 && $made >= $times) {
       $entry['payment_status'] = 'Active';
       $this->addon->expire_subscription($entry, ['note' => sprintf(__('All %d scheduled payments have been made.', 'usaepay-payments'), $times)]);
       gform_update_meta($id, 'usaepay_next_charge', '');
+      gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
+      $this->clearMarker($id);
       return 'expired';
     }
     [$nextIndex, $next] = Schedule::nextInstallmentAfter($start, $now, $length, $unit, $index + 1);
@@ -281,6 +294,8 @@ final class Renewals {
     gform_update_meta($id, 'usaepay_installment_index', $nextIndex);
     gform_update_meta($id, 'usaepay_scheduled_date', $next->format('Y-m-d H:i:s'));
     gform_update_meta($id, 'usaepay_next_charge', $next->format('Y-m-d H:i:s'));
+    gform_update_meta($id, 'usaepay_last_transaction_key', $transaction);
+    $this->clearMarker($id);
     return 'charged';
   }
 

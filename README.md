@@ -40,8 +40,8 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
   the subscription is cancelled with a note. "Recurring Times" expires the
   entry after that many payments (status **Expired**).
 - Renewals cannot double-charge: the `orderid` of each attempt is written to
-  the entry before the charge is sent and cleared once the outcome is
-  recorded. A run that finds one looks it up at USAePay first (bounded by the
+  the entry before the charge is sent and cleared last, after the outcome
+  is recorded. A run that finds one looks it up at USAePay first (bounded by the
   time it was sent, so a miss is conclusive) and records the earlier charge
   instead of sending another. When USAePay cannot be asked, nothing is charged
   and the entry is checked again next hour. Workers take a database lock, so
@@ -50,7 +50,11 @@ client extracted from the CiviCRM `usaepayjs` extension, so gateway behaviour
   reference stays on the entry for reference.
 - **Refund via USAePay** (entry detail, one-time payments): unsettled sales
   are voided in full, settled ones refunded in full or in part. The entry
-  becomes **Refunded** and a refund transaction is recorded.
+  becomes **Refunded** and a refund transaction is recorded. A refund whose
+  answer was lost is found at USAePay before it could be sent again.
+- On a multi-page form the **USAePay Card** field must sit on the last page:
+  the single-use key is minted when the form is submitted, and the editor
+  warns when the field is anywhere else.
 - Notification events: Payment Completed/Failed/Refunded, Subscription
   Created/Payment Added/Payment Failed/Cancelled/Expired.
 - Apple Pay: enable it in Settings > USAePay; the button appears on forms
@@ -120,6 +124,27 @@ Every charge sends `custid` = payer email, `invoice` = `GF<form>-<submission>`
 (one-time) or `GF-<entry>` (renewals), `GIVE-<donation>` / `GIVE-S<subscription>` for GiveWP, `WC-<order number>` for WooCommerce, `orderid` = an idempotency reference
 (`gf-<entry>-<YYYY-MM-DD>-<attempt>` for renewals) and the billing address for
 AVS. No top-level `email` is sent, so USAePay does not email its own receipt.
+
+Every `orderid` starts with a six-character prefix derived from the site URL
+(filter `usaepay_payments_orderid_prefix`), so two sites on one USAePay account
+never reconcile each other's charges. USAePay ignores an `orderid` sent with a
+refund and gives the refund the sale's `orderid` instead, so refunds are
+reconciled by the sale's `orderid`, the transaction type and the amount.
+
+### Charge at most once
+
+Every charge and refund is guarded the same way: a marker (`orderid`, time and
+amount) is stored on the record before the request goes out, and a later
+attempt for the same record first looks that marker up at USAePay, bounded by
+the time it was sent so a miss is conclusive. Found: recorded without charging
+again. Missing: charged. USAePay unreachable or the listing window exhausted:
+nothing is sent and the admin or payer is told to wait or get in touch. Stores:
+WooCommerce order meta (`_usaepay_charge_sent`, `_usaepay_refund_sent`,
+`_usaepay_renewal_pending`), GiveWP donation meta (`_usaepay_charge_sent`,
+`_usaepay_refund_sent`), Gravity Forms entry meta (`usaepay_reconcile_*`,
+`usaepay_refund_sent`) and, for a submission that has no entry yet, a transient
+keyed by the submission's `orderid`. Cron workers hold a lock row in
+`wp_options` (inserted, not read-then-written) with an owner handle.
 
 ### Entry meta written by the add-on
 

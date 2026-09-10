@@ -15,6 +15,8 @@ use Give\Subscriptions\Models\Subscription;
 use Give\Subscriptions\Models\SubscriptionNote;
 use Give\Subscriptions\ValueObjects\SubscriptionStatus;
 use Usaepay\AmbiguousGatewayException;
+use Usaepay\ReconciliationInconclusiveException;
+use Usaepay\WordPress\Reconcile;
 use Usaepay\DonorMessage;
 use Usaepay\GatewayException;
 use Usaepay\WordPress\Gateway as Shared;
@@ -110,11 +112,11 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
     if ($key === '') {
       throw new PaymentGatewayException(__('Please enter your card details.', 'usaepay-payments'));
     }
-    $orderId = 'give-' . $donation->id;
+    $orderId = Shared::orderId('give-' . $donation->id);
     $metadata = $this->metadata($donation, 'GIVE-' . $donation->id, $orderId);
     $amount = $donation->amount->formatToDecimal();
 
-    $response = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, $amount, $metadata), $orderId, $donation);
+    $response = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, $amount, $metadata), $orderId, $donation, $amount);
     $reference = Shared::transactionReference($response);
     $command = new PaymentComplete($reference);
     $command->setPaymentNotes($this->gatewayNote($response));
@@ -137,9 +139,36 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
         $verb = __('voided before settlement', 'usaepay-payments');
       }
       else {
-        $response = $client->refund($reference);
         $verb = __('refunded', 'usaepay-payments');
+        // Refunds inherit the sale's orderid at USAePay. A marker in the
+        // donation meta makes sure a refund whose answer was lost is found,
+        // not repeated. It is never cleared on success: GiveWP records the
+        // refund after this returns, and a second call simply finds it again.
+        $saleOrderId = trim((string) ($transaction['orderid'] ?? ''));
+        $amount = $donation->amount->formatToDecimal();
+        if ($saleOrderId === '') {
+          $response = $client->refund($reference);
+        }
+        else {
+          $donationId = (int) $donation->id;
+          [$read, $write] = Reconcile::metaStore(
+            static fn() => give_get_meta($donationId, '_usaepay_refund_sent', TRUE),
+            static function (array $marker) use ($donationId): void { give_update_meta($donationId, '_usaepay_refund_sent', $marker); },
+            static function () use ($donationId): void { give_delete_meta($donationId, '_usaepay_refund_sent'); }
+          );
+          $result = Reconcile::once($client, $read, $write, $saleOrderId, $amount, static fn($c) => $c->refund($reference), \Usaepay\GatewayClient::TYPES_REFUND);
+          $response = $result['response'];
+          if ($result['reconciled']) {
+            DonationNote::create(['donationId' => $donationId, 'content' => __('USAePay confirms the earlier refund went through; recorded without refunding again.', 'usaepay-payments')]);
+          }
+        }
       }
+    }
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+      Log::error('GiveWP refund unresolved', ['donation' => $donation->id, 'error' => $e->getMessage()]);
+      $message = Reconcile::refundBlockedMessage($e, $reference);
+      DonationNote::create(['donationId' => $donation->id, 'content' => $message]);
+      throw new PaymentGatewayException($message);
     }
     catch (GatewayException $e) {
       Log::error('GiveWP refund failed', ['donation' => $donation->id, 'error' => $e->getMessage()]);
@@ -165,11 +194,11 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
     if ($key === '') {
       throw new PaymentGatewayException(__('Please enter your card details.', 'usaepay-payments'));
     }
-    $orderId = 'give-' . $donation->id;
+    $orderId = Shared::orderId('give-' . $donation->id);
     $metadata = $this->metadata($donation, 'GIVE-' . $donation->id, $orderId);
     $amount = $donation->amount->formatToDecimal();
 
-    $response = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, $amount, $metadata, TRUE), $orderId, $donation);
+    $response = $this->charge(static fn($client) => $client->saleWithPaymentKey($key, $amount, $metadata, TRUE), $orderId, $donation, $amount);
     $cardReference = trim((string) ($response['savedcard']['key'] ?? ''));
     if ($cardReference === '') {
       Log::error('GiveWP subscription: approved without saved card; voiding', ['donation' => $donation->id]);
@@ -240,8 +269,12 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
 
   /**
    * Run a charge and turn every failure into donor-safe wording.
+   *
+   * The charge is made at most once per donation: a marker in the donation's
+   * meta is stored before the request, and a resubmit after a lost response
+   * or a crash finds the earlier approval instead of charging again.
    */
-  public function charge(callable $call, string $orderId, Donation $donation): array {
+  public function charge(callable $call, string $orderId, Donation $donation, ?string $amount = NULL): array {
     try {
       $client = $this->shared()->client(self::INTEGRATION, self::mode());
     }
@@ -249,22 +282,30 @@ final class Gateway extends PaymentGateway implements PaymentGatewayRefundable {
       Log::error('GiveWP: not configured', ['error' => $e->getMessage()]);
       throw new PaymentGatewayException(__('The payment system is not configured correctly, so no charge was made. Please contact us so we can fix it.', 'usaepay-payments'));
     }
+    $donationId = (int) $donation->id;
+    $read = static fn() => give_get_meta($donationId, '_usaepay_charge_sent', TRUE);
+    $write = static function (?array $marker) use ($donationId): void {
+      if ($marker === NULL) {
+        give_delete_meta($donationId, '_usaepay_charge_sent');
+      }
+      else {
+        give_update_meta($donationId, '_usaepay_charge_sent', $marker);
+      }
+    };
     try {
-      $response = $call($client);
+      $result = Reconcile::once($client, $read, $write, $orderId, $amount, $call);
+      $response = $result['response'];
+      if ($result['reconciled']) {
+        DonationNote::create(['donationId' => $donationId, 'content' => sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $orderId)]);
+      }
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      Log::error('GiveWP: reconciliation inconclusive', ['donation' => $donationId, 'error' => $e->getMessage()]);
+      throw new PaymentGatewayException(__('An earlier attempt to make this payment may have gone through, and the card processor could not confirm it. Nothing was charged now. Please contact us before trying again.', 'usaepay-payments'));
     }
     catch (AmbiguousGatewayException $e) {
-      Log::error('GiveWP: ambiguous response', ['donation' => $donation->id, 'error' => $e->getMessage()]);
-      $found = NULL;
-      try {
-        $found = $client->findTransactionByOrderId($orderId, time());
-      }
-      catch (\Throwable $lookup) {
-        Log::error('GiveWP: reconciliation failed', ['error' => $lookup->getMessage()]);
-      }
-      if (!$found || !Shared::approved($found)) {
-        throw new PaymentGatewayException(__('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'));
-      }
-      $response = $found;
+      Log::error('GiveWP: ambiguous response', ['donation' => $donationId, 'error' => $e->getMessage()]);
+      throw new PaymentGatewayException(__('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'));
     }
     catch (GatewayException $e) {
       Log::error('GiveWP: gateway error', ['donation' => $donation->id, 'error' => $e->getMessage()]);

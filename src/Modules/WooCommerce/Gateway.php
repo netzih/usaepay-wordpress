@@ -9,6 +9,7 @@ use Usaepay\ReconciliationInconclusiveException;
 use Usaepay\WordPress\Gateway as Shared;
 use Usaepay\WordPress\Lock;
 use Usaepay\WordPress\Plugin;
+use Usaepay\WordPress\Reconcile;
 
 /**
  * WooCommerce payment gateway. Works on the block checkout (via
@@ -249,7 +250,7 @@ final class Gateway extends \WC_Payment_Gateway {
     $paymentKey = trim((string) ($_POST['usaepay_payment_key'] ?? ''));
     $saveCard = $this->shouldSaveCard($order);
     $amount = (float) $order->get_total();
-    $orderId = 'wc-' . $order->get_id();
+    $orderId = Shared::orderId('wc-' . $order->get_id());
     $metadata = $this->metadata($order, $orderId);
 
     $cardReference = '';
@@ -268,7 +269,7 @@ final class Gateway extends \WC_Payment_Gateway {
     if ($amount <= 0) {
       // Free order (e.g. subscription with free trial): store the card only.
       if ($cardReference === '') {
-        $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $metadata), NULL, $order);
+        $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $metadata), $orderId, $order, \Usaepay\GatewayClient::CARD_VERIFICATION_AMOUNT);
         if (!empty($outcome['error'])) {
           return $this->failure($outcome['error']);
         }
@@ -288,10 +289,10 @@ final class Gateway extends \WC_Payment_Gateway {
     }
 
     if ($cardReference !== '') {
-      $outcome = $this->charge(static fn($client) => $client->saleWithCardReference($cardReference, self::money($amount), $metadata), $orderId, $order);
+      $outcome = $this->charge(static fn($client) => $client->saleWithCardReference($cardReference, self::money($amount), $metadata), $orderId, $order, self::money($amount));
     }
     else {
-      $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($paymentKey, self::money($amount), $metadata, $saveCard), $orderId, $order);
+      $outcome = $this->charge(static fn($client) => $client->saleWithPaymentKey($paymentKey, self::money($amount), $metadata, $saveCard), $orderId, $order, self::money($amount));
     }
     if (!empty($outcome['error'])) {
       return $this->failure($outcome['error']);
@@ -532,9 +533,35 @@ final class Gateway extends \WC_Payment_Gateway {
         $verb = __('voided before settlement', 'usaepay-payments');
       }
       else {
-        $response = $client->refund($reference, self::money($amount));
         $verb = __('refunded', 'usaepay-payments');
+        // Refunds inherit the sale's orderid at USAePay. A marker on the order
+        // makes sure a refund whose answer was lost is found, not repeated.
+        $saleOrderId = trim((string) ($transaction['orderid'] ?? ''));
+        if ($saleOrderId === '') {
+          $response = $client->refund($reference, self::money($amount));
+        }
+        else {
+          [$read, $write] = Reconcile::metaStore(
+            static fn() => $order->get_meta('_usaepay_refund_sent'),
+            static function (array $marker) use ($order): void { $order->update_meta_data('_usaepay_refund_sent', $marker); $order->save(); },
+            static function () use ($order): void { $order->delete_meta_data('_usaepay_refund_sent'); $order->save(); }
+          );
+          $result = Reconcile::once($client, $read, $write, $saleOrderId, self::money($amount), static fn($c) => $c->refund($reference, self::money($amount)), \Usaepay\GatewayClient::TYPES_REFUND);
+          if ($result['reconciled'] && abs((float) $result['amount'] - $amount) >= 0.005) {
+            // The refund dialog shows this text raw, so no price markup.
+            return new \WP_Error('usaepay', Reconcile::refundMismatchMessage(html_entity_decode(wp_strip_all_tags(wc_price((float) $result['amount'], ['currency' => $order->get_currency()])), ENT_QUOTES), Shared::transactionReference($result['response'])));
+          }
+          $response = $result['response'];
+          if ($result['reconciled']) {
+            $order->add_order_note(__('USAePay confirms the earlier refund went through; recorded without refunding again.', 'usaepay-payments'));
+          }
+          $clearRefundMarker = $write;
+        }
       }
+    }
+    catch (ReconciliationInconclusiveException | AmbiguousGatewayException $e) {
+      $this->log('Refund unresolved for order ' . $order_id . ': ' . $e->getMessage(), 'error');
+      return new \WP_Error('usaepay', Reconcile::refundBlockedMessage($e, $reference));
     }
     catch (GatewayException $e) {
       $this->log('Refund failed for order ' . $order_id . ': ' . $e->getMessage(), 'error');
@@ -544,6 +571,11 @@ final class Gateway extends \WC_Payment_Gateway {
       $failure = Shared::failure($response);
       $this->log('Refund declined for order ' . $order_id . ': ' . $failure['gateway'], 'error');
       return new \WP_Error('usaepay', $failure['gateway']);
+    }
+    if (isset($clearRefundMarker)) {
+      // WooCommerce created the refund record before calling in, so once the
+      // gateway has approved there is nothing left that could be lost.
+      $clearRefundMarker(NULL);
     }
     $order->add_order_note(sprintf(
       __('%1$s %2$s via USAePay. Reference: %3$s%4$s', 'usaepay-payments'),
@@ -569,8 +601,9 @@ final class Gateway extends \WC_Payment_Gateway {
     }
     // Action Scheduler runs one job at a time, but an admin "Retry payment"
     // can overlap it; only one charge attempt per order at a time.
-    $lock = 'wc_renewal_' . $order->get_id();
-    if (!Lock::acquire($lock, 10 * MINUTE_IN_SECONDS)) {
+    $lockName = 'wc_renewal_' . $order->get_id();
+    $lock = Lock::acquire($lockName, 10 * MINUTE_IN_SECONDS);
+    if ($lock === NULL) {
       $order->add_order_note(__('USAePay: another renewal attempt for this order is still running; nothing was charged.', 'usaepay-payments'));
       return;
     }
@@ -578,7 +611,7 @@ final class Gateway extends \WC_Payment_Gateway {
       $this->chargeRenewal($order, (float) $amount);
     }
     finally {
-      Lock::release($lock);
+      Lock::release($lockName, $lock);
     }
   }
 
@@ -608,48 +641,75 @@ final class Gateway extends \WC_Payment_Gateway {
     if ($order->is_paid() || trim((string) $order->get_meta(self::META_TRANSACTION)) !== '') {
       return;
     }
-    // An earlier attempt may have been charged without a readable response
-    // (timeout, fatal): look every previous orderid up before charging again.
-    // The attempt counter and first-attempt time are written BEFORE each
-    // charge, so nothing sent can escape this check.
+    // Every attempt is recorded (orderid + time) BEFORE its charge is sent
+    // and removed only once USAePay gave a conclusive answer. Attempts still
+    // listed are looked up before anything new is sent, each within its own
+    // time window, so a lost response can never turn into a second charge
+    // and an old, settled decline never blocks a retry.
     $attempts = (int) $order->get_meta('_usaepay_renewal_attempts');
-    $firstSentAt = (int) $order->get_meta('_usaepay_renewal_sent_at');
-    for ($i = 0; $i < $attempts; $i++) {
+    $pending = $this->pendingAttempts($order);
+    foreach ($pending as $i => $attempt) {
       try {
-        $found = $this->findApproved('wc-' . $order->get_id() . '-' . $i, $firstSentAt ?: NULL);
+        $found = $this->findApproved((string) $attempt['orderid'], (int) $attempt['sent_at'] ?: NULL, self::money($amount));
       }
       catch (ReconciliationInconclusiveException $e) {
-        $order->add_order_note(sprintf(__('USAePay could not confirm whether attempt %d was charged (%s). The order stays pending and nothing new was charged; retry later.', 'usaepay-payments'), $i + 1, $e->getMessage()));
+        $order->add_order_note(sprintf(__('USAePay could not confirm whether the earlier attempt %1$s was charged (%2$s). The order stays pending and nothing new was charged; retry later.', 'usaepay-payments'), $attempt['orderid'], $e->getMessage()));
         return;
       }
       if ($found) {
-        $order->add_order_note(sprintf(__('USAePay: attempt %d had already been charged; recorded without charging again.', 'usaepay-payments'), $i + 1));
+        $order->add_order_note(sprintf(__('USAePay: the earlier attempt %s had already been charged; recorded without charging again.', 'usaepay-payments'), $attempt['orderid']));
+        unset($pending[$i]);
+        $order->update_meta_data('_usaepay_renewal_pending', array_values($pending));
         $this->completeRenewal($order, $found);
         return;
       }
+      // Provably not charged: nothing more to check for this one.
+      unset($pending[$i]);
     }
-    $orderId = 'wc-' . $order->get_id() . '-' . $attempts;
+    $orderId = Shared::orderId('wc-' . $order->get_id() . '-' . $attempts);
     $metadata = $this->metadata($order, $orderId);
     unset($metadata['clientip']);
+    $pending[] = ['orderid' => $orderId, 'sent_at' => time()];
     $order->update_meta_data('_usaepay_renewal_attempts', $attempts + 1);
-    if ($firstSentAt <= 0) {
-      $order->update_meta_data('_usaepay_renewal_sent_at', time());
-    }
+    $order->update_meta_data('_usaepay_renewal_pending', array_values($pending));
     $order->save();
 
     $outcome = $this->charge(static fn($client) => $client->saleWithCardReference($cardReference, self::money($amount), $metadata), $orderId, $order);
     if (!empty($outcome['ambiguous'])) {
-      // Leave the order pending: a "failed" status would make Subscriptions
-      // retry, and the charge may have gone through. The next run (or an
-      // admin "Retry payment") reconciles via the loop above.
+      // Leave the order pending and the attempt listed: a "failed" status
+      // would make Subscriptions retry, and the charge may have gone through.
+      // The next run (or an admin "Retry payment") reconciles it first.
       $order->add_order_note(__('USAePay did not answer conclusively; the order is left pending and will be reconciled before any new charge.', 'usaepay-payments'));
       return;
     }
+    // A conclusive answer: this attempt needs no further lookup.
+    $order->update_meta_data('_usaepay_renewal_pending', array_values(array_filter($pending, static fn($p) => ($p['orderid'] ?? '') !== $orderId)));
+    $order->save();
     if (!empty($outcome['error'])) {
       $order->update_status('failed', sprintf(__('USAePay renewal charge failed: %s', 'usaepay-payments'), $outcome['gateway'] ?? $outcome['error']));
       return;
     }
     $this->completeRenewal($order, $outcome['response']);
+  }
+
+  /**
+   * Renewal attempts without a conclusive answer yet: [{orderid, sent_at}].
+   * Orders from before this list existed fall back to every attempt made.
+   *
+   * @return array<int, array{orderid: string, sent_at: int}>
+   */
+  private function pendingAttempts(\WC_Order $order): array {
+    $pending = $order->get_meta('_usaepay_renewal_pending');
+    if (is_array($pending)) {
+      return array_values(array_filter($pending, static fn($p) => is_array($p) && !empty($p['orderid'])));
+    }
+    $attempts = (int) $order->get_meta('_usaepay_renewal_attempts');
+    $sentAt = (int) $order->get_meta('_usaepay_renewal_sent_at');
+    $legacy = [];
+    for ($i = 0; $i < $attempts; $i++) {
+      $legacy[] = ['orderid' => 'wc-' . $order->get_id() . '-' . $i, 'sent_at' => $sentAt];
+    }
+    return $legacy;
   }
 
   private function completeRenewal(\WC_Order $order, array $response): void {
@@ -669,9 +729,9 @@ final class Gateway extends \WC_Payment_Gateway {
    *   When the answer is unknown: the listing window ran out or the lookup
    *   itself failed. Callers must not charge.
    */
-  private function findApproved(string $orderId, ?int $sentAt): ?array {
+  private function findApproved(string $orderId, ?int $sentAt, string $amount): ?array {
     try {
-      $found = $this->shared()->client(self::INTEGRATION)->findTransactionByOrderId($orderId, $sentAt);
+      $found = $this->shared()->client(self::INTEGRATION)->findTransactionByOrderId($orderId, $sentAt, 5, $amount);
     }
     catch (ReconciliationInconclusiveException $e) {
       throw $e;
@@ -703,8 +763,9 @@ final class Gateway extends \WC_Payment_Gateway {
       return $this->failure(__('Please enter your card details.', 'usaepay-payments'));
     }
     else {
-      $metadata = $this->metadata($subscription, 'wc-sub-' . $subscription->get_id());
-      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $metadata), NULL, $subscription);
+      $subOrderId = Shared::orderId('wc-sub-' . $subscription->get_id() . '-' . time());
+      $metadata = $this->metadata($subscription, $subOrderId);
+      $outcome = $this->charge(static fn($client) => $client->verifyAndSaveCardWithPaymentKey($paymentKey, $metadata), $subOrderId, NULL);
       if (!empty($outcome['error'])) {
         return $this->failure($outcome['error']);
       }
@@ -731,9 +792,17 @@ final class Gateway extends \WC_Payment_Gateway {
   // ---------------------------------------------------------------------
 
   /**
-   * @return array{response?: array, error?: string, gateway?: string}
+   * Run a gateway call with the shared failure handling.
+   *
+   * With an $orderId, an $order and an $amount the call is made at most once
+   * for that order: a marker in the order's meta is stored before the request
+   * and a resubmit after a lost response or a crash finds the earlier approval
+   * instead of charging again. Renewals pass no $amount and keep their own
+   * per-attempt list.
+   *
+   * @return array{response?: array, error?: string, gateway?: string, ambiguous?: bool}
    */
-  private function charge(callable $call, ?string $orderId, ?\WC_Order $order): array {
+  private function charge(callable $call, ?string $orderId, ?\WC_Order $order, ?string $amount = NULL): array {
     try {
       $client = $this->shared()->client(self::INTEGRATION);
     }
@@ -742,26 +811,40 @@ final class Gateway extends \WC_Payment_Gateway {
       return ['error' => __('The payment system is not configured correctly, so no charge was made. Please contact us so we can fix it.', 'usaepay-payments'), 'gateway' => $e->getMessage()];
     }
     try {
-      $response = $call($client);
+      if ($orderId !== NULL && $order && $amount !== NULL) {
+        $read = static fn() => $order->get_meta('_usaepay_charge_sent');
+        $write = static function (?array $marker) use ($order): void {
+          if ($marker === NULL) {
+            $order->delete_meta_data('_usaepay_charge_sent');
+          }
+          else {
+            $order->update_meta_data('_usaepay_charge_sent', $marker);
+          }
+          $order->save();
+        };
+        $result = Reconcile::once($client, $read, $write, $orderId, $amount, $call);
+        $response = $result['response'];
+        if ($result['reconciled']) {
+          $order->add_order_note(sprintf(__('USAePay confirms the earlier charge %s went through; recorded without charging again.', 'usaepay-payments'), $orderId));
+        }
+      }
+      else {
+        $response = $call($client);
+      }
+    }
+    catch (ReconciliationInconclusiveException $e) {
+      $this->log('Reconciliation inconclusive: ' . $e->getMessage(), 'error');
+      if ($order) {
+        $order->add_order_note(sprintf(__('USAePay could not confirm whether an earlier charge for this order went through (%s). Nothing was charged; check the console before retrying.', 'usaepay-payments'), $e->getMessage()));
+      }
+      return ['error' => __('An earlier attempt to make this payment may have gone through, and the card processor could not confirm it. Nothing was charged now. Please contact us before trying again.', 'usaepay-payments'), 'gateway' => $e->getMessage(), 'ambiguous' => TRUE];
     }
     catch (AmbiguousGatewayException $e) {
       $this->log('Ambiguous response: ' . $e->getMessage(), 'error');
-      $found = NULL;
-      if ($orderId !== NULL) {
-        try {
-          $found = $client->findTransactionByOrderId($orderId, time());
-        }
-        catch (\Throwable $lookup) {
-          $this->log('Reconciliation failed: ' . $lookup->getMessage(), 'error');
-        }
+      if ($order) {
+        $order->add_order_note(sprintf(__('USAePay did not answer conclusively (%s). Check the console before retrying.', 'usaepay-payments'), $e->getMessage()));
       }
-      if (!$found || !Shared::approved($found)) {
-        if ($order) {
-          $order->add_order_note(sprintf(__('USAePay did not answer conclusively (%s). Check the console before retrying.', 'usaepay-payments'), $e->getMessage()));
-        }
-        return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'), 'gateway' => $e->getMessage(), 'ambiguous' => TRUE];
-      }
-      $response = $found;
+      return ['error' => __('The payment could not be completed because the card processor did not respond. Please wait a moment and try again. If the problem continues, contact us.', 'usaepay-payments'), 'gateway' => $e->getMessage(), 'ambiguous' => TRUE];
     }
     catch (GatewayException $e) {
       $this->log('Gateway error: ' . $e->getMessage(), 'error');

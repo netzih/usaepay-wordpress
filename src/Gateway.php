@@ -84,6 +84,17 @@ final class Gateway {
     return array_filter($metadata, static fn($v) => $v !== '' && $v !== []);
   }
 
+  /**
+   * Orderids carry a short site prefix so two sites sharing one USAePay
+   * account can never reconcile each other's charges. Every module builds
+   * its orderids through here and looks them up by the same string.
+   */
+  public static function orderId(string $id): string {
+    $prefix = apply_filters('usaepay_payments_orderid_prefix', substr(md5((string) home_url()), 0, 6));
+    $prefix = preg_replace('/[^A-Za-z0-9]/', '', (string) $prefix);
+    return ($prefix !== '' ? $prefix . '-' : '') . $id;
+  }
+
   public function clientIp(): string {
     $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash((string) $_SERVER['REMOTE_ADDR'])) : '';
     return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';

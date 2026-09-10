@@ -270,6 +270,46 @@ final class GatewayClientTest extends TestCase {
     $client->void('bnfb4dbycv5pfrd');
   }
 
+  public function testFindTransactionByOrderIdFiltersByAmountAndType(): void {
+    $client = new GatewayClient('key', 'pin', 'https://sandbox.usaepay.com/api/v2', static function (): array {
+      return ['status' => 200, 'body' => json_encode(['type' => 'list', 'data' => [
+        ['key' => 'refund', 'orderid' => 'wc-9', 'trantype_code' => 'C', 'amount' => 5.00, 'result_code' => 'A'],
+        ['key' => 'void', 'orderid' => 'wc-9', 'trantype_code' => 'V', 'amount' => 5.00],
+        ['key' => 'wrong-amount', 'orderid' => 'wc-9', 'trantype_code' => 'S', 'amount' => 6.00],
+        ['key' => 'sale', 'orderid' => 'wc-9', 'trantype_code' => 'S', 'amount' => 5.00, 'result_code' => 'A'],
+      ]])];
+    });
+
+    // Charges: the refund (newest) and the void are skipped.
+    self::assertSame('sale', $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00')['key']);
+    self::assertSame('wrong-amount', $client->findTransactionByOrderId('wc-9', NULL, 5, '6')['key']);
+    self::assertNull($client->findTransactionByOrderId('wc-9', NULL, 5, '7.00'));
+    // Refunds inherit the sale's orderid, so the type is what tells them apart.
+    self::assertSame('refund', $client->findTransactionByOrderId('wc-9', NULL, 5, '5.00', GatewayClient::TYPES_REFUND)['key']);
+    self::assertNull($client->findTransactionByOrderId('wc-9', NULL, 5, '6.00', GatewayClient::TYPES_REFUND));
+  }
+
+  public function testRateLimitIsAmbiguous(): void {
+    $request = [];
+    $client = $this->client($request, 429, ['error' => 'Too Many Requests']);
+
+    $this->expectException(AmbiguousGatewayException::class);
+    $client->void('bnfb4dbycv5pfrd');
+  }
+
+  public function testRefundAndVerificationCarryOrderId(): void {
+    $request = [];
+    $client = $this->client($request, 200, ['result_code' => 'A', 'key' => 'k', 'refnum' => '1']);
+
+    $client->refund('5nf1fgqtpnhsmzv', '2.50', ['orderid' => 'wc-9-refund-1', 'invoice' => 'WC-9']);
+    self::assertSame(['command' => 'refund', 'trankey' => '5nf1fgqtpnhsmzv', 'amount' => '2.50', 'orderid' => 'wc-9-refund-1', 'invoice' => 'WC-9'], json_decode($request['body'], TRUE));
+
+    $client->verifyAndSaveCardWithPaymentKey('single-use', ['orderid' => 'wc-sub-3', 'invoice' => 'WC-3', 'custid' => 'a@b.c']);
+    $body = json_decode($request['body'], TRUE);
+    // The last request is the void of the authorization; the auth itself is the one before.
+    self::assertSame('void', $body['command']);
+  }
+
   public function testEmptyTransactionReferenceIsRejected(): void {
     $request = [];
     $client = $this->client($request, 200, ['result_code' => 'A']);

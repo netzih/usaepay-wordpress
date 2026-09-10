@@ -83,7 +83,8 @@ class GatewayClient {
       'description' => 'Card verification',
       'software' => $this->software,
     ];
-    foreach (['clientip', 'custid'] as $key) {
+    // orderid/invoice let a lost response be reconciled like any other charge.
+    foreach (['clientip', 'custid', 'orderid', 'invoice'] as $key) {
       if (isset($metadata[$key]) && $metadata[$key] !== '') {
         $payload[$key] = $metadata[$key];
       }
@@ -127,10 +128,17 @@ class GatewayClient {
    * @param string $reference
    *   USAePay refnum (digits) or transaction key.
    */
-  public function refund(string $reference, ?string $amount = NULL): array {
+  public function refund(string $reference, ?string $amount = NULL, array $metadata = []): array {
     $payload = ['command' => 'refund'] + $this->transactionReference($reference);
     if ($amount !== NULL) {
       $payload['amount'] = $this->normalizeAmount($amount);
+    }
+    // An orderid on the refund lets a lost response be reconciled before the
+    // refund is sent again.
+    foreach (['orderid', 'invoice', 'description'] as $key) {
+      if (isset($metadata[$key]) && $metadata[$key] !== '') {
+        $payload[$key] = $metadata[$key];
+      }
     }
     return $this->request('POST', '/transactions', $payload);
   }
@@ -184,6 +192,19 @@ class GatewayClient {
   public const CREATED_TIME_SLACK = 26 * 3600;
 
   /**
+   * trantype_code values of a charge: sale and authorization.
+   */
+  public const TYPES_CHARGE = ['S', 'A'];
+
+  /**
+   * trantype_code values of money going back: credit (refund of a sale) and
+   * a standalone refund. A refund inherits the orderid and invoice of the sale
+   * it reverses (verified against the sandbox; an orderid sent with the refund
+   * command is ignored), so refunds are found by the sale's orderid plus type.
+   */
+  public const TYPES_REFUND = ['C', 'R'];
+
+  /**
    * Find a recent transaction by the orderid we sent with it.
    *
    * The transactions list endpoint ignores filter parameters (verified against
@@ -195,6 +216,12 @@ class GatewayClient {
    *   before it (minus CREATED_TIME_SLACK): a miss is then conclusive.
    * @param int $maxPages
    *   Pages of 100 rows to read before giving up.
+   * @param string|null $amount
+   *   When given, only a row for this amount counts; a row with the orderid
+   *   but another amount is ignored. Guards against orderid reuse.
+   * @param string[] $types
+   *   trantype_code values that count (TYPES_CHARGE or TYPES_REFUND). Rows
+   *   without a type code always count.
    *
    * @return array|null
    *   The transaction row (with 'key', 'result_code', 'trantype_code',
@@ -206,17 +233,18 @@ class GatewayClient {
    *   When $maxPages were read without finding the orderid or reaching the
    *   cutoff (or, with no cutoff, the end of the listing).
    */
-  public function findTransactionByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5): ?array {
+  public function findTransactionByOrderId(string $orderId, ?int $sentAt = NULL, int $maxPages = 5, ?string $amount = NULL, array $types = self::TYPES_CHARGE): ?array {
     $orderId = trim($orderId);
     if ($orderId === '') {
       throw new \InvalidArgumentException('An orderid is required.');
     }
     $cutoff = $sentAt !== NULL ? $sentAt - self::CREATED_TIME_SLACK : NULL;
+    $amount = $amount === NULL ? NULL : $this->normalizeAmount($amount);
     $pageSize = 100;
     for ($page = 0; $page < max(1, $maxPages); $page++) {
       $rows = $this->listTransactions($pageSize, $page * $pageSize);
       foreach ($rows as $row) {
-        if (is_array($row) && (string) ($row['orderid'] ?? '') === $orderId) {
+        if (is_array($row) && (string) ($row['orderid'] ?? '') === $orderId && self::matches($row, $amount, $types)) {
           return $row;
         }
         if ($cutoff !== NULL) {
@@ -235,6 +263,22 @@ class GatewayClient {
       max(1, $maxPages) * $pageSize,
       $orderId
     ));
+  }
+
+  /**
+   * The row has one of the wanted types and the expected amount. Rows without
+   * a type code are accepted.
+   */
+  private static function matches(array $row, ?string $amount, array $types): bool {
+    $type = strtoupper(trim((string) ($row['trantype_code'] ?? '')));
+    if ($type !== '' && !in_array($type, $types, TRUE)) {
+      return FALSE;
+    }
+    if ($amount !== NULL && isset($row['amount']) && is_numeric($row['amount'])
+      && abs((float) $row['amount'] - (float) $amount) >= 0.005) {
+      return FALSE;
+    }
+    return TRUE;
   }
 
   /**
@@ -370,9 +414,11 @@ class GatewayClient {
     $decoded = json_decode($responseBody, TRUE);
     $data = is_array($decoded) ? $decoded : [];
 
-    // 5xx, no status (transport failure) and 408 (the gateway may have
-    // processed the request but timed out sending the answer) are ambiguous.
-    if ($status >= 500 || $status === 0 || $status === 408) {
+    // 5xx, no status (transport failure), 408 (the gateway may have processed
+    // the request but timed out sending the answer) and 429 (documented as
+    // "not processed", but a lookup is cheaper than trusting that) are
+    // ambiguous.
+    if ($status >= 500 || $status === 0 || $status === 408 || $status === 429) {
       throw new AmbiguousGatewayException(
         'USAePay did not return a conclusive response. Reconcile the transaction before retrying.',
         $status,

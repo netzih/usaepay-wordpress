@@ -8,3 +8,7 @@ if (!function_exists('__')) {
     return $text;
   }
 }
+
+if (!defined('HOUR_IN_SECONDS')) {
+  define('HOUR_IN_SECONDS', 3600);
+}

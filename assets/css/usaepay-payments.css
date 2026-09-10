@@ -37,3 +37,4 @@
 .usaepay-card-element--preview { display: flex; gap: 16px; align-items: center; color: #757575; font-size: 15px; }
 .usaepay-card-element--preview span:first-child { flex: 1; }
 .gform_wrapper .ginput_container_usaepay_card .usaepay-card-element { height: 44px; }
+.usaepay-card-note--warning { color: #b32d2e; opacity: 1; font-weight: 600; }

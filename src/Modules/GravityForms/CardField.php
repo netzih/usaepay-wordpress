@@ -76,21 +76,17 @@ final class CardField extends \GF_Field {
     $note = esc_html__('Card details are entered securely in a form hosted by USAePay.', 'usaepay-payments');
 
     if ($is_form_editor) {
+      $warning = '';
+      if ($this->notOnLastPage($form)) {
+        $warning = '<p class="usaepay-card-note usaepay-card-note--warning">' . esc_html__('Move this field to the last page. Card details are tokenized when the form is submitted, so the card fields must be on the page that submits it.', 'usaepay-payments') . '</p>';
+      }
       return '<div class="ginput_container ginput_container_usaepay_card">'
         . '<div class="usaepay-card-element usaepay-card-element--preview" aria-hidden="true"><span>' . esc_html__('Card number', 'usaepay-payments') . '</span><span>' . esc_html__('MM/YY', 'usaepay-payments') . '</span><span>' . esc_html__('CVV', 'usaepay-payments') . '</span></div>'
-        . '<p class="usaepay-card-note">' . $note . '</p></div>';
+        . '<p class="usaepay-card-note">' . $note . '</p>' . $warning . '</div>';
     }
 
     $apple_pay = $this->applePayAllowed($form) ? '1' : '0';
     $input_id = 'input_' . $form_id . '_' . $id;
-    // On a multi-page form the card is tokenized when its page is left; the
-    // key has to ride along on the later pages, where this field is not
-    // shown. On the card's own page it starts empty so a fresh key is minted.
-    $carry = '';
-    if (is_string($value) && $value !== '' && class_exists('GFFormDisplay') && (int) $this->pageNumber > 0
-      && (int) \GFFormDisplay::get_current_page($form_id) !== (int) $this->pageNumber) {
-      $carry = $value;
-    }
 
     return '<div class="ginput_container ginput_container_usaepay_card" data-usaepay-form="' . $form_id . '" data-usaepay-field="' . $id . '">'
       . '<div class="usaepay-apple-pay" id="' . esc_attr($base) . '-apple-pay" hidden>'
@@ -99,9 +95,23 @@ final class CardField extends \GF_Field {
       . '</div>'
       . '<div class="usaepay-card-element" id="' . esc_attr($base) . '-card" data-form-id="' . $form_id . '" data-field-id="' . $id . '" data-apple-pay="' . $apple_pay . '" aria-label="' . esc_attr__('Secure card details', 'usaepay-payments') . '"></div>'
       . '<div class="usaepay-card-errors" id="' . esc_attr($base) . '-errors" role="alert" aria-live="polite"></div>'
-      . '<input type="hidden" class="usaepay-payment-key" name="input_' . $id . '" id="' . esc_attr($input_id) . '" value="' . esc_attr($carry) . '" autocomplete="off">'
+      . '<input type="hidden" class="usaepay-payment-key" name="input_' . $id . '" id="' . esc_attr($input_id) . '" value="" autocomplete="off">'
       . '<p class="usaepay-card-note">' . $note . '</p>'
       . '</div>';
+  }
+
+  /**
+   * The single-use key is minted when the form is submitted, so on a
+   * multi-page form the field has to sit on the last page.
+   */
+  private function notOnLastPage(array $form): bool {
+    $pages = 1;
+    foreach ((array) ($form['fields'] ?? []) as $field) {
+      if (is_object($field) && $field->type === 'page') {
+        $pages++;
+      }
+    }
+    return $pages > 1 && (int) $this->pageNumber > 0 && (int) $this->pageNumber < $pages;
   }
 
   /**

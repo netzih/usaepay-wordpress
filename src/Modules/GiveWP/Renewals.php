@@ -44,7 +44,8 @@ final class Renewals {
   public function run(?\DateTimeImmutable $now = NULL): array {
     $now = $now ?? new \DateTimeImmutable('now', wp_timezone());
     $summary = ['due' => 0, 'charged' => 0, 'declined' => 0, 'cancelled' => 0, 'completed' => 0, 'skipped' => 0, 'ambiguous' => 0];
-    if (!Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS)) {
+    $lock = Lock::acquire(self::LOCK, 15 * MINUTE_IN_SECONDS);
+    if ($lock === NULL) {
       $summary['skipped']++;
       return $summary;
     }
@@ -56,7 +57,7 @@ final class Renewals {
       }
     }
     finally {
-      Lock::release(self::LOCK);
+      Lock::release(self::LOCK, $lock);
     }
     return $summary;
   }
@@ -96,7 +97,8 @@ final class Renewals {
       return 'completed';
     }
     $lockKey = 'give_renewal_' . $id;
-    if (!Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS)) {
+    $lock = Lock::acquire($lockKey, 10 * MINUTE_IN_SECONDS);
+    if ($lock === NULL) {
       return 'skipped';
     }
 
@@ -105,7 +107,7 @@ final class Renewals {
       $attempt = (int) ($state['attempts'] ?? 0);
       $scheduled = $subscription->renewsAt instanceof \DateTimeInterface ? $subscription->renewsAt->format('Y-m-d') : $now->format('Y-m-d');
       $installment = (string) ($state['installment'] ?? $scheduled);
-      $orderId = sprintf('give-sub-%d-%s-%d', $id, $installment, $attempt);
+      $orderId = Shared::orderId(sprintf('give-sub-%d-%s-%d', $id, $installment, $attempt));
       $initial = $subscription->initialDonation();
       $invoice = 'GIVE-S' . $id;
       $payer = $initial ? [
@@ -140,10 +142,19 @@ final class Renewals {
           // A previous run sent this charge and never recorded the answer.
           // Find out what happened before sending another one; an unanswered
           // lookup keeps the marker and ends this run without a charge.
-          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL);
-          SubscriptionNote::create(['subscriptionId' => $id, 'content' => $response
-            ? sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)
-            : sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId)]);
+          $response = $this->findTransaction($client, $pendingOrderId, $pendingSentAt ?: NULL, $amount);
+          $earlierKey = $response ? Shared::transactionReference($response) : '';
+          if ($response && $earlierKey !== '' && give()->donations->getByGatewayTransactionId($earlierKey)) {
+            // Recorded in full by a run that died just before clearing the
+            // marker; this run is for the next installment.
+            $this->clearMarker($id);
+            $response = NULL;
+          }
+          else {
+            SubscriptionNote::create(['subscriptionId' => $id, 'content' => $response
+              ? sprintf(__('USAePay confirms the earlier charge %s was processed; recorded without charging again.', 'usaepay-payments'), $pendingOrderId)
+              : sprintf(__('USAePay has no record of the earlier charge %s; charging now.', 'usaepay-payments'), $pendingOrderId)]);
+          }
         }
         if ($response === NULL) {
           $this->setMarker($id, $orderId);
@@ -158,7 +169,7 @@ final class Renewals {
       catch (AmbiguousGatewayException $e) {
         Log::error('GiveWP renewal ambiguous', ['subscription' => $id, 'error' => $e->getMessage()]);
         try {
-          $found = $this->findTransaction($client, $orderId, time());
+          $found = $this->findTransaction($client, $orderId, time(), $amount);
         }
         catch (ReconciliationInconclusiveException $lookup) {
           $found = NULL;
@@ -189,7 +200,7 @@ final class Renewals {
       return $this->recordFailure($subscription, $response, $installment, $attempt, $now);
     }
     finally {
-      Lock::release($lockKey);
+      Lock::release($lockKey, $lock);
     }
   }
 
@@ -197,16 +208,10 @@ final class Renewals {
     $id = (int) $subscription->id;
     $transaction = Shared::transactionReference($response);
     if ($transaction !== '' && give()->donations->getByGatewayTransactionId($transaction)) {
-      // Recorded by a run that died before it could clean up: finish that.
-      Log::debug('GiveWP renewal already recorded', ['subscription' => $id, 'transaction' => $transaction]);
-      if ($subscription->renewsAt instanceof \DateTimeInterface && $subscription->renewsAt <= new \DateTime('now', wp_timezone())) {
-        $subscription->bumpRenewalDate();
-      }
-      if ($subscription->status->isFailing()) {
-        $subscription->status = SubscriptionStatus::ACTIVE();
-      }
-      $subscription->save();
-      $this->saveState($id, NULL);
+      // Should not happen (the pending-marker path handles this case); never
+      // move the renewal date here, that would skip an installment.
+      Log::error('GiveWP renewal already recorded', ['subscription' => $id, 'transaction' => $transaction]);
+      $this->clearMarker($id);
       return 'skipped';
     }
     // A retry moved renewsAt to the retry date; put the real due date back so
@@ -282,9 +287,9 @@ final class Renewals {
    *   When the answer is unknown: the listing window ran out or the lookup
    *   itself failed. Callers must not charge.
    */
-  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt): ?array {
+  private function findTransaction(\Usaepay\GatewayClient $client, string $orderId, ?int $sentAt, string $amount): ?array {
     try {
-      return $client->findTransactionByOrderId($orderId, $sentAt);
+      return $client->findTransactionByOrderId($orderId, $sentAt, 5, $amount);
     }
     catch (ReconciliationInconclusiveException $e) {
       throw $e;
