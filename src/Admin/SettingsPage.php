@@ -223,11 +223,11 @@ final class SettingsPage {
     check_admin_referer('usaepay_run_renewals');
     $messages = [];
     $plugin = \Usaepay\WordPress\Plugin::instance();
-    if (class_exists('GFAPI') && class_exists(\Usaepay\WordPress\Modules\GravityForms\AddOn::class)) {
+    if ($plugin->moduleEnabled('gravityforms') && class_exists('GFAPI') && class_exists(\Usaepay\WordPress\Modules\GravityForms\AddOn::class)) {
       $summary = (new \Usaepay\WordPress\Modules\GravityForms\Renewals(\Usaepay\WordPress\Modules\GravityForms\AddOn::get_instance(), $this->gateway, $this->settings))->run();
       $messages[] = __('Gravity Forms:', 'usaepay-payments') . ' ' . self::summaryText($summary);
     }
-    if (function_exists('give')) {
+    if ($plugin->moduleEnabled('givewp') && function_exists('give')) {
       $summary = (new \Usaepay\WordPress\Modules\GiveWP\Renewals())->run();
       $messages[] = __('GiveWP:', 'usaepay-payments') . ' ' . self::summaryText($summary);
     }

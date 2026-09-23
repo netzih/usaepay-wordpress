@@ -50,6 +50,21 @@ directory, or `bin/build-zip.sh` to make the same zip a release ships.
 4. On the live source key allow **Sale, Auth Only, Void and Credit (refund)**.
    Auth Only + Void are used to verify a card for a free trial; Credit for refunds.
 
+### Turning modules off
+
+Each host-plugin module registers only when its plugin is active. To keep one
+off anyway (another USAePay gateway already serves that plugin, or the site
+only needs the shared settings and gateway for a plugin built on them), filter
+`usaepay_payments_modules`, for example from a must-use plugin:
+
+```php
+add_filter('usaepay_payments_modules', fn(array $m) => ['givewp' => FALSE] + $m);
+```
+
+Keys: `gravityforms`, `givewp`, `woocommerce`. A module that is off registers
+no gateway, settings section or cron event, and its records are left out of
+"Unresolved requests".
+
 ## Gravity Forms
 
 - Add the **USAePay Card** field (Pricing Fields) to a form with a product or

@@ -36,7 +36,13 @@ final class Unresolved {
    * @return array<int, array{key: string, module: string, record: string, url: string, kind: string, orderid: string, sent_at: int, amount: ?string, types: string[], exclude: string[], mode: string, hint: string}>
    */
   public function items(): array {
-    $items = array_merge($this->woocommerce(), $this->gravityForms(), $this->giveWP(), $this->submissions());
+    $plugin = \Usaepay\WordPress\Plugin::instance();
+    $items = array_merge(
+      $plugin->moduleEnabled('woocommerce') ? $this->woocommerce() : [],
+      $plugin->moduleEnabled('gravityforms') ? $this->gravityForms() : [],
+      $plugin->moduleEnabled('givewp') ? $this->giveWP() : [],
+      $plugin->moduleEnabled('gravityforms') ? $this->submissions() : []
+    );
     usort($items, static fn(array $a, array $b) => $b['sent_at'] <=> $a['sent_at']);
     return $items;
   }
