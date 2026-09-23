@@ -12,3 +12,15 @@ if (!function_exists('__')) {
 if (!defined('HOUR_IN_SECONDS')) {
   define('HOUR_IN_SECONDS', 3600);
 }
+
+if (!function_exists('sanitize_text_field')) {
+  function sanitize_text_field(string $text): string {
+    return trim(preg_replace('/[\r\n\t ]+/', ' ', strip_tags($text)));
+  }
+}
+
+if (!function_exists('sanitize_key')) {
+  function sanitize_key(string $key): string {
+    return preg_replace('/[^a-z0-9_\-]/', '', strtolower($key));
+  }
+}

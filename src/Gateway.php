@@ -26,15 +26,22 @@ final class Gateway {
    *   Shown in the USAePay console's "software" column, e.g. "Gravity Forms".
    * @param string|null $mode
    *   Force live or sandbox; defaults to the configured mode.
+   * @param string|null $account
+   *   One of Settings::accounts(); defaults to the default account.
    */
-  public function client(string $integration, ?string $mode = NULL): GatewayClient {
+  public function client(string $integration, ?string $mode = NULL, ?string $account = NULL): GatewayClient {
     $mode = $mode ?? $this->settings->mode();
-    if (!$this->settings->hasApiCredentials($mode)) {
-      throw new GatewayException(__('USAePay is not configured. Enter the API key and PIN under Settings > USAePay.', 'usaepay-payments'));
+    if (!$this->settings->hasAccount($account)) {
+      throw new GatewayException(sprintf(__('The USAePay account "%s" no longer exists under Settings > USAePay.', 'usaepay-payments'), (string) $account));
+    }
+    if (!$this->settings->hasApiCredentials($mode, $account)) {
+      throw new GatewayException(Settings::isDefault($account)
+        ? __('USAePay is not configured. Enter the API key and PIN under Settings > USAePay.', 'usaepay-payments')
+        : sprintf(__('The USAePay account "%s" has no API key and PIN for this mode. Enter them under Settings > USAePay.', 'usaepay-payments'), $this->settings->accountLabel($account)));
     }
     return new GatewayClient(
-      $this->settings->apiKey($mode),
-      $this->settings->apiPin($mode),
+      $this->settings->apiKey($mode, $account),
+      $this->settings->apiPin($mode, $account),
       $this->settings->apiUrl($mode),
       NULL,
       $this->software($integration)

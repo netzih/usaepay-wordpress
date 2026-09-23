@@ -5,6 +5,12 @@ namespace Usaepay\WordPress;
 /**
  * Account settings shared by every module. One option row; live and sandbox
  * credentials are both kept so switching modes does not lose either.
+ *
+ * The top-level credentials are the default account. More accounts can be
+ * added under "accounts" (each with its own live and sandbox keys) for
+ * plugins that charge different forms to different merchant accounts; they
+ * pass the account id to the credential getters and Gateway::client(). The
+ * mode is shared by all accounts.
  */
 final class Settings {
 
@@ -13,6 +19,10 @@ final class Settings {
   public const MODE_LIVE = 'live';
 
   public const MODE_SANDBOX = 'sandbox';
+
+  public const DEFAULT_ACCOUNT = 'default';
+
+  private const CREDENTIALS = ['live_api_key', 'live_api_pin', 'live_public_key', 'sandbox_api_key', 'sandbox_api_pin', 'sandbox_public_key'];
 
   private ?array $values = NULL;
 
@@ -28,6 +38,7 @@ final class Settings {
       'apple_pay' => FALSE,
       'apple_pay_display_name' => '',
       'debug_log' => FALSE,
+      'accounts' => [],
     ];
   }
 
@@ -55,32 +66,84 @@ final class Settings {
     return $this->mode() === self::MODE_SANDBOX;
   }
 
-  public function apiKey(?string $mode = NULL): string {
-    return trim((string) $this->get(($mode ?? $this->mode()) . '_api_key'));
+  /**
+   * Every account by id, the default first: id => label.
+   *
+   * @return array<string, string>
+   */
+  public function accounts(): array {
+    $out = [self::DEFAULT_ACCOUNT => __('Default account', 'usaepay-payments')];
+    foreach ($this->extraAccounts() as $id => $account) {
+      $out[$id] = $account['label'];
+    }
+    return $out;
   }
 
-  public function apiPin(?string $mode = NULL): string {
-    return (string) $this->get(($mode ?? $this->mode()) . '_api_pin');
+  /**
+   * The accounts added besides the default, by id.
+   *
+   * @return array<string, array>
+   */
+  public function extraAccounts(): array {
+    $out = [];
+    foreach ((array) $this->get('accounts') as $account) {
+      if (is_array($account) && !empty($account['id']) && $account['id'] !== self::DEFAULT_ACCOUNT) {
+        $out[(string) $account['id']] = $account + array_fill_keys(self::CREDENTIALS, '') + ['label' => (string) $account['id']];
+      }
+    }
+    return $out;
   }
 
-  public function publicKey(?string $mode = NULL): string {
-    return trim((string) $this->get(($mode ?? $this->mode()) . '_public_key'));
+  public function hasAccount(?string $account): bool {
+    return self::isDefault($account) || isset($this->extraAccounts()[$account]);
+  }
+
+  public static function isDefault(?string $account): bool {
+    return $account === NULL || $account === '' || $account === self::DEFAULT_ACCOUNT;
+  }
+
+  public function accountLabel(?string $account): string {
+    return $this->accounts()[self::isDefault($account) ? self::DEFAULT_ACCOUNT : $account] ?? (string) $account;
+  }
+
+  /**
+   * One credential of an account. An account id that no longer exists has
+   * no credentials: a charge meant for it is never sent to another account.
+   */
+  private function credential(string $field, ?string $mode, ?string $account): string {
+    $key = ($mode ?? $this->mode()) . '_' . $field;
+    if (self::isDefault($account)) {
+      return (string) $this->get($key);
+    }
+    return (string) ($this->extraAccounts()[$account][$key] ?? '');
+  }
+
+  public function apiKey(?string $mode = NULL, ?string $account = NULL): string {
+    return trim($this->credential('api_key', $mode, $account));
+  }
+
+  public function apiPin(?string $mode = NULL, ?string $account = NULL): string {
+    return $this->credential('api_pin', $mode, $account);
+  }
+
+  public function publicKey(?string $mode = NULL, ?string $account = NULL): string {
+    return trim($this->credential('public_key', $mode, $account));
   }
 
   /**
    * The API key and PIN are present: server-side calls (charges, refunds,
    * renewals) can be made.
    */
-  public function hasApiCredentials(?string $mode = NULL): bool {
-    return $this->apiKey($mode) !== '' && $this->apiPin($mode) !== '';
+  public function hasApiCredentials(?string $mode = NULL, ?string $account = NULL): bool {
+    return $this->apiKey($mode, $account) !== '' && $this->apiPin($mode, $account) !== '';
   }
 
   /**
    * Everything a checkout needs: API credentials plus the Pay.js public key
    * the browser uses to tokenize cards.
    */
-  public function isConfigured(?string $mode = NULL): bool {
-    return $this->hasApiCredentials($mode) && $this->publicKey($mode) !== '';
+  public function isConfigured(?string $mode = NULL, ?string $account = NULL): bool {
+    return $this->hasApiCredentials($mode, $account) && $this->publicKey($mode, $account) !== '';
   }
 
   public function apiUrl(?string $mode = NULL): string {
@@ -134,9 +197,64 @@ final class Settings {
     $clean['apple_pay'] = !empty($input['apple_pay']);
     $clean['apple_pay_display_name'] = sanitize_text_field((string) ($input['apple_pay_display_name'] ?? ''));
     $clean['debug_log'] = !empty($input['debug_log']);
+    $clean['accounts'] = self::sanitizeAccounts($input['accounts'] ?? [], $this->extraAccounts());
 
     $this->values = $clean;
     return $clean;
+  }
+
+  /**
+   * Rows of the "Additional accounts" table. A row keeps its id once saved
+   * (records that were charged through it refer to it); a new row gets one
+   * from its label. A blank PIN keeps the stored one, as for the default
+   * account. Rows marked for removal and rows with no label and no key are
+   * dropped.
+   *
+   * @param array<string, array> $current
+   *   The stored accounts by id.
+   */
+  public static function sanitizeAccounts(mixed $rows, array $current): array {
+    $out = [];
+    $taken = [self::DEFAULT_ACCOUNT => TRUE];
+    foreach (is_array($rows) ? $rows : [] as $row) {
+      if (!is_array($row) || !empty($row['remove'])) {
+        continue;
+      }
+      $label = sanitize_text_field((string) ($row['label'] ?? ''));
+      $id = sanitize_key((string) ($row['id'] ?? ''));
+      $existing = $id !== '' && isset($current[$id]) ? $current[$id] : NULL;
+      $account = ['id' => '', 'label' => $label];
+      foreach (['live', 'sandbox'] as $mode) {
+        foreach (['api_key', 'public_key'] as $field) {
+          $account[$mode . '_' . $field] = sanitize_text_field((string) ($row[$mode . '_' . $field] ?? ''));
+        }
+        $pin = trim((string) ($row[$mode . '_api_pin'] ?? ''));
+        $account[$mode . '_api_pin'] = $pin !== '' ? $pin : (string) ($existing[$mode . '_api_pin'] ?? '');
+        if (!empty($row[$mode . '_clear_pin'])) {
+          $account[$mode . '_api_pin'] = '';
+        }
+      }
+      if ($label === '' && $account['live_api_key'] === '' && $account['sandbox_api_key'] === '') {
+        continue;
+      }
+      if ($existing === NULL) {
+        $base = sanitize_key(str_replace(' ', '-', strtolower($label))) ?: 'account';
+        // Numeric ids would turn into integer array keys.
+        $base = ctype_digit($base) ? 'account-' . $base : $base;
+        $id = $base;
+        for ($n = 2; isset($taken[$id]) || isset($current[$id]); $n++) {
+          $id = $base . '-' . $n;
+        }
+      }
+      if (isset($taken[$id])) {
+        continue;
+      }
+      $taken[$id] = TRUE;
+      $account['id'] = $id;
+      $account['label'] = $label !== '' ? $label : $id;
+      $out[] = $account;
+    }
+    return $out;
   }
 
 }

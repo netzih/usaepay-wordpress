@@ -33,7 +33,7 @@ final class Unresolved {
   }
 
   /**
-   * @return array<int, array{key: string, module: string, record: string, url: string, kind: string, orderid: string, sent_at: int, amount: ?string, types: string[], exclude: string[], mode: string, hint: string}>
+   * @return array<int, array{key: string, module: string, record: string, url: string, kind: string, orderid: string, sent_at: int, amount: ?string, types: string[], exclude: string[], mode: string, account: string, hint: string}>
    */
   public function items(): array {
     $plugin = \Usaepay\WordPress\Plugin::instance();
@@ -64,7 +64,7 @@ final class Unresolved {
    */
   public function check(array $item): array {
     try {
-      $client = $this->gateway->client('admin check', $item['mode']);
+      $client = $this->gateway->client('admin check', $item['mode'], $item['account'] ?? NULL);
       $found = Reconcile::lookup($client, $item['orderid'], $item['sent_at'] ?: NULL, $item['amount'], $item['types'], $item['exclude']);
     }
     catch (ReconciliationInconclusiveException $e) {
@@ -280,12 +280,15 @@ final class Unresolved {
    *   The stored marker: orderid, sent_at, amount, exclude.
    * @param string $hint
    *   What the administrator should do when the request went through.
+   * @param string $account
+   *   The account the request went to (Settings::accounts()); empty for the
+   *   default account.
    */
-  public static function makeItem(string $module, string $record, string $url, string $kind, array $marker, string $mode, string $hint): array {
+  public static function makeItem(string $module, string $record, string $url, string $kind, array $marker, string $mode, string $hint, string $account = ''): array {
     $orderId = (string) $marker['orderid'];
     $sentAt = (int) ($marker['sent_at'] ?? 0);
     return [
-      'key' => md5($module . '|' . $record . '|' . $kind . '|' . $orderId . '|' . $sentAt),
+      'key' => md5($module . '|' . $record . '|' . $kind . '|' . $orderId . '|' . $sentAt . '|' . $account),
       'module' => $module,
       'record' => $record,
       'url' => $url,
@@ -296,6 +299,7 @@ final class Unresolved {
       'types' => $kind === 'refund' ? GatewayClient::TYPES_REFUND : GatewayClient::TYPES_CHARGE,
       'exclude' => isset($marker['exclude']) && is_array($marker['exclude']) ? array_map('strval', $marker['exclude']) : [],
       'mode' => $mode,
+      'account' => $account,
       'hint' => $hint,
     ];
   }
