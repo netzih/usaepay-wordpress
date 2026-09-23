@@ -41,7 +41,8 @@ final class Unresolved {
       $plugin->moduleEnabled('woocommerce') ? $this->woocommerce() : [],
       $plugin->moduleEnabled('gravityforms') ? $this->gravityForms() : [],
       $plugin->moduleEnabled('givewp') ? $this->giveWP() : [],
-      $plugin->moduleEnabled('gravityforms') ? $this->submissions() : []
+      $plugin->moduleEnabled('gravityforms') ? $this->submissions() : [],
+      $this->extensions()
     );
     usort($items, static fn(array $a, array $b) => $b['sent_at'] <=> $a['sent_at']);
     return $items;
@@ -247,7 +248,40 @@ final class Unresolved {
     return $items;
   }
 
+  /**
+   * Items from other plugins that charge through this one. Each hooked
+   * callback appends items built with Unresolved::makeItem():
+   *
+   *   add_filter('usaepay_payments_unresolved', function (array $items) {
+   *     $items[] = Unresolved::makeItem('My plugin', 'Entry #5', $url, 'charge', $marker, $mode, $hint);
+   *     return $items;
+   *   });
+   *
+   * @return array[]
+   */
+  private function extensions(): array {
+    $items = apply_filters('usaepay_payments_unresolved', [], $this->settings);
+    if (!is_array($items)) {
+      return [];
+    }
+    return array_values(array_filter($items, static fn($item) => is_array($item) && !empty($item['key']) && !empty($item['orderid']) && isset($item['types'], $item['mode'])));
+  }
+
   private function item(string $module, string $record, string $url, string $kind, array $marker, string $mode, string $hint): array {
+    return self::makeItem($module, $record, $url, $kind, $marker, $mode, $hint);
+  }
+
+  /**
+   * One list row for a marker left by Reconcile::once().
+   *
+   * @param string $kind
+   *   'charge' or 'refund'.
+   * @param array $marker
+   *   The stored marker: orderid, sent_at, amount, exclude.
+   * @param string $hint
+   *   What the administrator should do when the request went through.
+   */
+  public static function makeItem(string $module, string $record, string $url, string $kind, array $marker, string $mode, string $hint): array {
     $orderId = (string) $marker['orderid'];
     $sentAt = (int) ($marker['sent_at'] ?? 0);
     return [

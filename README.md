@@ -65,6 +65,24 @@ Keys: `gravityforms`, `givewp`, `woocommerce`. A module that is off registers
 no gateway, settings section or cron event, and its records are left out of
 "Unresolved requests".
 
+### Plugins built on this one
+
+Another plugin can charge through the shared services instead of talking to
+USAePay itself: `Plugin::instance()->gateway()->client('<name>')` for a
+configured `GatewayClient`, `Gateway::metadata()` and `Gateway::orderId()` for
+the request conventions below, `Reconcile::once()` for the charge-at-most-once
+guard, `Lock` for its own workers and `Schedule` for installment dates. The
+browser helper `assets/js/usaepay-payjs.js` (`window.UsaepayPayJs`) mounts the
+Pay.js card fields, mints payment keys and offers Apple Pay.
+
+Two filters let such a plugin appear on Settings > USAePay:
+
+- `usaepay_payments_unresolved` (array of items, `Settings`): append a row
+  for each in-flight marker, built with `Admin\Unresolved::makeItem()`.
+- `usaepay_payments_renewal_workers` (array `label => callable`): each callable
+  runs that plugin's renewal worker and returns a summary of counts; "Run
+  renewal workers now" calls it.
+
 ## Gravity Forms
 
 - Add the **USAePay Card** field (Pricing Fields) to a form with a product or
