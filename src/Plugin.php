@@ -11,7 +11,7 @@ use Usaepay\DonorMessage;
  */
 final class Plugin {
 
-  public const VERSION = '0.1.2';
+  public const VERSION = '0.2.0';
 
   public const SLUG = 'usaepay-payments';
 

@@ -50,6 +50,28 @@ directory, or `bin/build-zip.sh` to make the same zip a release ships.
 4. On the live source key allow **Sale, Auth Only, Void and Credit (refund)**.
    Auth Only + Void are used to verify a card for a free trial; Credit for refunds.
 
+### Additional accounts
+
+The credentials above are the **default account**, used by Gravity Forms,
+GiveWP and WooCommerce. Under **Additional accounts** you can add more
+USAePay merchant accounts, each with a name and its own live and sandbox API
+key, PIN and Pay.js public key (the mode switch applies to all). Plugins
+built on this one can charge to them: Embed Forms lets each form pick an
+account. **Check credentials** checks every account.
+
+An account keeps the id it was given when first saved (shown next to its
+name), because payments refer to it: renewals, refunds and lookups always go
+to the account a payment was made with. Do not remove an account that still
+has active recurring payments; a charge for a removed account is refused,
+never sent to another one.
+
+For code: `Settings::accounts()` (id => name), and an optional account id
+as the last argument of `apiKey()`, `apiPin()`, `publicKey()`,
+`hasApiCredentials()`, `isConfigured()` and `Gateway::client()`. `NULL`,
+`''` and `'default'` mean the default account. `Admin\Unresolved::makeItem()`
+takes the account as an optional last argument so "Check at USAePay" asks
+the right one.
+
 ### Turning modules off
 
 Each host-plugin module registers only when its plugin is active. To keep one

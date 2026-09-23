@@ -68,7 +68,7 @@ final class SettingsPage {
     ?>
     <div class="wrap">
       <h1><?php esc_html_e('USAePay Payments', 'usaepay-payments'); ?></h1>
-      <p><?php esc_html_e('One USAePay account for every form and checkout on this site. Card details are entered in fields hosted by USAePay (Pay.js); this site only ever handles single-use payment keys and saved-card references.', 'usaepay-payments'); ?></p>
+      <p><?php esc_html_e('The default USAePay account serves every form and checkout on this site; plugins that support it (Embed Forms) can charge chosen forms to one of the additional accounts below. Card details are entered in fields hosted by USAePay (Pay.js); this site only ever handles single-use payment keys and saved-card references.', 'usaepay-payments'); ?></p>
 
       <form method="post" action="options.php">
         <?php settings_fields('usaepay_payments'); ?>
@@ -116,6 +116,8 @@ final class SettingsPage {
           </table>
         <?php endforeach; ?>
 
+        <?php $this->renderAccounts(); ?>
+
         <h2><?php esc_html_e('Options', 'usaepay-payments'); ?></h2>
         <table class="form-table" role="presentation">
           <tr>
@@ -145,6 +147,54 @@ final class SettingsPage {
   }
 
   /**
+   * More merchant accounts, each with its own live and sandbox credentials,
+   * plus one blank row to add another. The mode above applies to all.
+   */
+  private function renderAccounts(): void {
+    $name = Settings::OPTION . '[accounts]';
+    $rows = array_values($this->settings->extraAccounts());
+    $rows[] = NULL;
+    ?>
+    <h2><?php esc_html_e('Additional accounts', 'usaepay-payments'); ?></h2>
+    <p class="description"><?php esc_html_e('Other USAePay merchant accounts a form can be charged to instead of the default one (Embed Forms: choose the account under the form\'s Settings > Payments). Charges, renewals and refunds always go to the account a payment was made with, so change a form\'s account freely, but do not remove an account that still has active recurring payments.', 'usaepay-payments'); ?></p>
+    <?php foreach ($rows as $i => $account) :
+      $field = static fn(string $key) => esc_attr($name . '[' . $i . '][' . $key . ']');
+      $id = 'usaepay-account-' . $i;
+      ?>
+      <table class="form-table usaepay-account" role="presentation" style="border-top:1px solid #c3c4c7">
+        <tr>
+          <th scope="row"><label for="<?php echo esc_attr($id); ?>-label"><?php echo $account ? esc_html__('Account name', 'usaepay-payments') : esc_html__('Add an account', 'usaepay-payments'); ?></label></th>
+          <td>
+            <input id="<?php echo esc_attr($id); ?>-label" class="regular-text" type="text" name="<?php echo $field('label'); ?>" value="<?php echo esc_attr($account['label'] ?? ''); ?>" placeholder="<?php echo $account ? '' : esc_attr__('e.g. Camp account', 'usaepay-payments'); ?>">
+            <?php if ($account) : ?>
+              <input type="hidden" name="<?php echo $field('id'); ?>" value="<?php echo esc_attr($account['id']); ?>">
+              <code style="margin-left:8px"><?php echo esc_html($account['id']); ?></code>
+              <label style="margin-left:12px"><input type="checkbox" name="<?php echo $field('remove'); ?>" value="1"> <?php esc_html_e('Remove this account', 'usaepay-payments'); ?></label>
+            <?php else : ?>
+              <p class="description"><?php esc_html_e('Fill in a name and the keys, then save. Leave blank to add nothing.', 'usaepay-payments'); ?></p>
+            <?php endif; ?>
+          </td>
+        </tr>
+        <?php foreach (['live' => __('Live', 'usaepay-payments'), 'sandbox' => __('Sandbox', 'usaepay-payments')] as $mode => $modeLabel) :
+          $pin = (string) ($account[$mode . '_api_pin'] ?? '');
+          ?>
+          <tr>
+            <th scope="row"><?php echo esc_html($modeLabel); ?></th>
+            <td>
+              <p><label><?php esc_html_e('API key (source key)', 'usaepay-payments'); ?><br><input class="regular-text code" type="text" autocomplete="off" name="<?php echo $field($mode . '_api_key'); ?>" value="<?php echo esc_attr($account[$mode . '_api_key'] ?? ''); ?>"></label></p>
+              <p><label><?php esc_html_e('API PIN', 'usaepay-payments'); ?><br><input class="regular-text code" type="password" autocomplete="new-password" name="<?php echo $field($mode . '_api_pin'); ?>" value="" placeholder="<?php echo $pin !== '' ? esc_attr__('(saved — leave blank to keep)', 'usaepay-payments') : ''; ?>"></label>
+                <?php if ($pin !== '') : ?>
+                  <label style="margin-left:8px"><input type="checkbox" name="<?php echo $field($mode . '_clear_pin'); ?>" value="1"> <?php esc_html_e('Clear saved PIN', 'usaepay-payments'); ?></label>
+                <?php endif; ?></p>
+              <p><label><?php esc_html_e('Pay.js public key', 'usaepay-payments'); ?><br><input class="regular-text code" type="text" autocomplete="off" name="<?php echo $field($mode . '_public_key'); ?>" value="<?php echo esc_attr($account[$mode . '_public_key'] ?? ''); ?>"></label></p>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+      </table>
+    <?php endforeach;
+  }
+
+  /**
    * Charges and refunds whose answer was never recorded, with a check action.
    */
   private function renderUnresolved(): void {
@@ -165,6 +215,7 @@ final class SettingsPage {
             <th><?php esc_html_e('Sent', 'usaepay-payments'); ?></th>
             <th><?php esc_html_e('Amount', 'usaepay-payments'); ?></th>
             <th><?php esc_html_e('Mode', 'usaepay-payments'); ?></th>
+            <th><?php esc_html_e('Account', 'usaepay-payments'); ?></th>
             <th></th>
           </tr>
         </thead>
@@ -178,6 +229,7 @@ final class SettingsPage {
               <td><?php echo $item['sent_at'] > 0 ? esc_html(wp_date(get_option('date_format') . ' ' . get_option('time_format'), $item['sent_at'])) : '&mdash;'; ?></td>
               <td><?php echo $item['amount'] !== NULL ? esc_html($item['amount']) : '&mdash;'; ?></td>
               <td><?php echo esc_html($item['mode']); ?></td>
+              <td><?php echo esc_html($this->settings->accountLabel($item['account'] ?? '')); ?></td>
               <td><a class="button button-small" href="<?php echo esc_url($checkUrl); ?>"><?php esc_html_e('Check at USAePay', 'usaepay-payments'); ?></a></td>
             </tr>
           <?php endforeach; ?>
@@ -270,7 +322,8 @@ final class SettingsPage {
   }
 
   /**
-   * Prove the saved credentials for the current mode work, without charging.
+   * Prove the saved credentials of every account for the current mode
+   * work, without charging.
    */
   public function checkCredentials(): void {
     if (!current_user_can('manage_options')) {
@@ -279,43 +332,55 @@ final class SettingsPage {
     check_admin_referer('usaepay_check_credentials');
 
     $mode = $this->settings->mode();
-    $label = $mode === Settings::MODE_LIVE ? __('Live', 'usaepay-payments') : __('Sandbox', 'usaepay-payments');
     $messages = [];
     $ok = TRUE;
-
-    if (!$this->settings->hasApiCredentials($mode)) {
-      $ok = FALSE;
-      $messages[] = sprintf(__('%s credentials are incomplete: the API key and PIN are both required.', 'usaepay-payments'), $label);
-    }
-    else {
-      $client = $this->gateway->client('settings check', $mode);
-      try {
-        $list = $client->verifyCredentials();
-        $rows = is_array($list['data'] ?? NULL) ? count($list['data']) : 0;
-        $messages[] = $rows > 0
-          ? sprintf(__('%s API key and PIN work (the account has transactions).', 'usaepay-payments'), $label)
-          : sprintf(__('%s API key and PIN work (no transactions on the account yet).', 'usaepay-payments'), $label);
-      }
-      catch (GatewayException $e) {
-        $ok = FALSE;
-        $messages[] = sprintf(__('%1$s API key or PIN rejected: %2$s', 'usaepay-payments'), $label, $e->getMessage());
-      }
-      try {
-        if ($this->settings->publicKey($mode) === '') {
-          throw new GatewayException(__('none entered; the checkout card fields need it.', 'usaepay-payments'));
-        }
-        $client->verifyPublicKey($this->settings->publicKey($mode));
-        $messages[] = sprintf(__('%s Pay.js public key accepted.', 'usaepay-payments'), $label);
-      }
-      catch (GatewayException $e) {
-        $ok = FALSE;
-        $messages[] = sprintf(__('%1$s Pay.js public key rejected: %2$s', 'usaepay-payments'), $label, $e->getMessage());
-      }
+    $accounts = $this->settings->accounts();
+    foreach ($accounts as $account => $accountLabel) {
+      $modeLabel = $mode === Settings::MODE_LIVE ? __('Live', 'usaepay-payments') : __('Sandbox', 'usaepay-payments');
+      $label = count($accounts) > 1 ? $accountLabel . ' — ' . $modeLabel : $modeLabel;
+      $result = $this->checkAccount($mode, $account, $label);
+      $ok = $ok && $result['ok'];
+      $messages = array_merge($messages, $result['messages']);
     }
 
     set_transient(self::NOTICE_TRANSIENT . '_' . get_current_user_id(), ['ok' => $ok, 'messages' => $messages], 120);
     wp_safe_redirect(admin_url('options-general.php?page=' . self::PAGE));
     exit;
+  }
+
+  /**
+   * @return array{ok: bool, messages: string[]}
+   */
+  private function checkAccount(string $mode, string $account, string $label): array {
+    $messages = [];
+    $ok = TRUE;
+    if (!$this->settings->hasApiCredentials($mode, $account)) {
+      return ['ok' => FALSE, 'messages' => [sprintf(__('%s credentials are incomplete: the API key and PIN are both required.', 'usaepay-payments'), $label)]];
+    }
+    $client = $this->gateway->client('settings check', $mode, $account);
+    try {
+      $list = $client->verifyCredentials();
+      $rows = is_array($list['data'] ?? NULL) ? count($list['data']) : 0;
+      $messages[] = $rows > 0
+        ? sprintf(__('%s API key and PIN work (the account has transactions).', 'usaepay-payments'), $label)
+        : sprintf(__('%s API key and PIN work (no transactions on the account yet).', 'usaepay-payments'), $label);
+    }
+    catch (GatewayException $e) {
+      $ok = FALSE;
+      $messages[] = sprintf(__('%1$s API key or PIN rejected: %2$s', 'usaepay-payments'), $label, $e->getMessage());
+    }
+    try {
+      if ($this->settings->publicKey($mode, $account) === '') {
+        throw new GatewayException(__('none entered; the checkout card fields need it.', 'usaepay-payments'));
+      }
+      $client->verifyPublicKey($this->settings->publicKey($mode, $account));
+      $messages[] = sprintf(__('%s Pay.js public key accepted.', 'usaepay-payments'), $label);
+    }
+    catch (GatewayException $e) {
+      $ok = FALSE;
+      $messages[] = sprintf(__('%1$s Pay.js public key rejected: %2$s', 'usaepay-payments'), $label, $e->getMessage());
+    }
+    return ['ok' => $ok, 'messages' => $messages];
   }
 
   public function showNotice(): void {
