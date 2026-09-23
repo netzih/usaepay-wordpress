@@ -71,15 +71,33 @@ final class Plugin {
     add_action('before_woocommerce_init', [$this, 'wooCompatibility']);
   }
 
+  public const MODULES = ['gravityforms', 'givewp', 'woocommerce'];
+
+  /**
+   * Whether a host-plugin module may register. All are on by default; a site
+   * that only needs the shared settings and gateway (for another plugin built
+   * on them), or that runs a different USAePay gateway for one host plugin,
+   * switches modules off with the usaepay_payments_modules filter:
+   *
+   *   add_filter('usaepay_payments_modules', fn($m) => ['givewp' => FALSE] + $m);
+   *
+   * Read when each hook fires, so the filter can be added by a plugin that
+   * loads after this one.
+   */
+  public function moduleEnabled(string $module): bool {
+    $modules = apply_filters('usaepay_payments_modules', array_fill_keys(self::MODULES, TRUE));
+    return is_array($modules) && !empty($modules[$module]);
+  }
+
   public function wooGateways(array $gateways): array {
-    if (class_exists('WC_Payment_Gateway')) {
+    if ($this->moduleEnabled('woocommerce') && class_exists('WC_Payment_Gateway')) {
       $gateways[] = Modules\WooCommerce\Gateway::class;
     }
     return $gateways;
   }
 
   public function wooBlocks($registry): void {
-    if (class_exists('\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType')) {
+    if ($this->moduleEnabled('woocommerce') && class_exists('\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType')) {
       $registry->register(new Modules\WooCommerce\BlocksSupport());
     }
   }
@@ -94,7 +112,7 @@ final class Plugin {
   public const CRON_GIVEWP = 'usaepay_givewp_renewals';
 
   public function bootGiveWP($registrar): void {
-    if (!class_exists('\Give\Framework\PaymentGateways\PaymentGateway')) {
+    if (!$this->moduleEnabled('givewp') || !class_exists('\Give\Framework\PaymentGateways\PaymentGateway')) {
       return;
     }
     try {
@@ -106,12 +124,15 @@ final class Plugin {
   }
 
   public function giveSettingsSection(array $sections): array {
+    if (!$this->moduleEnabled('givewp')) {
+      return $sections;
+    }
     $sections[Modules\GiveWP\Gateway::ID] = __('USAePay', 'usaepay-payments');
     return $sections;
   }
 
   public function giveSettingsFields(array $settings): array {
-    if (!function_exists('give_get_current_setting_section') || give_get_current_setting_section() !== Modules\GiveWP\Gateway::ID) {
+    if (!$this->moduleEnabled('givewp') || !function_exists('give_get_current_setting_section') || give_get_current_setting_section() !== Modules\GiveWP\Gateway::ID) {
       return $settings;
     }
     $url = admin_url('options-general.php?page=' . Admin\SettingsPage::PAGE);
@@ -133,13 +154,17 @@ final class Plugin {
     if (!function_exists('give')) {
       return;
     }
+    if (!$this->moduleEnabled('givewp')) {
+      wp_clear_scheduled_hook(self::CRON_GIVEWP);
+      return;
+    }
     if (!wp_next_scheduled(self::CRON_GIVEWP)) {
       wp_schedule_event(time() + 300, 'hourly', self::CRON_GIVEWP);
     }
   }
 
   public function runGiveRenewals(): void {
-    if (!function_exists('give') || !class_exists('\Give\Subscriptions\Models\Subscription')) {
+    if (!$this->moduleEnabled('givewp') || !function_exists('give') || !class_exists('\Give\Subscriptions\Models\Subscription')) {
       return;
     }
     $summary = (new Modules\GiveWP\Renewals())->run();
@@ -151,7 +176,7 @@ final class Plugin {
   }
 
   public function bootGravityForms(): void {
-    if (!method_exists('GFForms', 'include_payment_addon_framework')) {
+    if (!$this->moduleEnabled('gravityforms') || !method_exists('GFForms', 'include_payment_addon_framework')) {
       return;
     }
     \GFForms::include_payment_addon_framework();

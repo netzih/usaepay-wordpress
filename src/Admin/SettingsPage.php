@@ -186,7 +186,7 @@ final class SettingsPage {
     <?php endif; ?>
     <p>
       <a class="button" href="<?php echo esc_url($runUrl); ?>"><?php esc_html_e('Run renewal workers now', 'usaepay-payments'); ?></a>
-      <span class="description"><?php esc_html_e('Charges every due Gravity Forms and GiveWP subscription and records any renewal listed above whose charge went through. WooCommerce Subscriptions renewals run on their own scheduler.', 'usaepay-payments'); ?></span>
+      <span class="description"><?php esc_html_e('Charges every due subscription of Gravity Forms, GiveWP and any other plugin that charges through this one, and records any renewal listed above whose charge went through. WooCommerce Subscriptions renewals run on their own scheduler.', 'usaepay-payments'); ?></span>
     </p>
     <?php
   }
@@ -223,20 +223,37 @@ final class SettingsPage {
     check_admin_referer('usaepay_run_renewals');
     $messages = [];
     $plugin = \Usaepay\WordPress\Plugin::instance();
-    if (class_exists('GFAPI') && class_exists(\Usaepay\WordPress\Modules\GravityForms\AddOn::class)) {
+    if ($plugin->moduleEnabled('gravityforms') && class_exists('GFAPI') && class_exists(\Usaepay\WordPress\Modules\GravityForms\AddOn::class)) {
       $summary = (new \Usaepay\WordPress\Modules\GravityForms\Renewals(\Usaepay\WordPress\Modules\GravityForms\AddOn::get_instance(), $this->gateway, $this->settings))->run();
       $messages[] = __('Gravity Forms:', 'usaepay-payments') . ' ' . self::summaryText($summary);
     }
-    if (function_exists('give')) {
+    if ($plugin->moduleEnabled('givewp') && function_exists('give')) {
       $summary = (new \Usaepay\WordPress\Modules\GiveWP\Renewals())->run();
       $messages[] = __('GiveWP:', 'usaepay-payments') . ' ' . self::summaryText($summary);
     }
+    foreach (self::renewalWorkers() as $label => $worker) {
+      $summary = $worker();
+      $messages[] = $label . ': ' . self::summaryText(is_array($summary) ? $summary : []);
+    }
     if (!$messages) {
-      $messages[] = __('Neither Gravity Forms nor GiveWP is active.', 'usaepay-payments');
+      $messages[] = __('No plugin with a renewal worker is active.', 'usaepay-payments');
     }
     set_transient(self::NOTICE_TRANSIENT . '_' . get_current_user_id(), ['ok' => TRUE, 'messages' => $messages], 120);
     wp_safe_redirect(admin_url('options-general.php?page=' . self::PAGE));
     exit;
+  }
+
+  /**
+   * Renewal workers of other plugins that charge through this one, keyed by
+   * the label shown in the notice. Each returns a summary of counts.
+   *
+   *   add_filter('usaepay_payments_renewal_workers', fn(array $w) => $w + ['My plugin' => fn() => $worker->run()]);
+   *
+   * @return array<string, callable(): array<string, int>>
+   */
+  private static function renewalWorkers(): array {
+    $workers = apply_filters('usaepay_payments_renewal_workers', []);
+    return is_array($workers) ? array_filter($workers, 'is_callable') : [];
   }
 
   /**
